@@ -22,6 +22,7 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useSetConcurrency,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -59,6 +60,8 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState(String(credential.maxConcurrency))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -66,6 +69,7 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setConcurrency = useSetConcurrency()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -93,6 +97,26 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleConcurrencyChange = () => {
+    const n = parseInt(concurrencyValue, 10)
+    if (isNaN(n) || n < 1 || n > 100) {
+      toast.error('并发数必须在 1-100 之间')
+      return
+    }
+    setConcurrency.mutate(
+      { id: credential.id, maxConcurrency: n },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingConcurrency(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -253,6 +277,49 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">并发：</span>
+              {editingConcurrency ? (
+                <div className="inline-flex items-center gap-1 ml-1">
+                  <Input
+                    type="number"
+                    value={concurrencyValue}
+                    onChange={(e) => setConcurrencyValue(e.target.value)}
+                    className="w-14 h-7 text-sm"
+                    min="1"
+                    max="100"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleConcurrencyChange}
+                    disabled={setConcurrency.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingConcurrency(false)
+                      setConcurrencyValue(String(credential.maxConcurrency))
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingConcurrency(true)}
+                  title="点击编辑"
+                >
+                  {credential.inFlight}/{credential.maxConcurrency}
+                </span>
+              )}
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>

@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  RequestLogListResponse,
+  RequestLogDetail,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +104,34 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 设置凭据并发上限
+export async function setCredentialConcurrency(
+  id: number,
+  maxConcurrency: number,
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/concurrency`,
+    { maxConcurrency },
+  )
+  return data
+}
+
+// 请求日志列表
+export async function listRequests(params: {
+  limit?: number
+  offset?: number
+  status?: string
+  accountId?: string
+} = {}): Promise<RequestLogListResponse> {
+  const { data } = await api.get<RequestLogListResponse>('/requests', { params })
+  return data
+}
+
+// 请求日志详情
+export async function getRequestDetail(id: string): Promise<RequestLogDetail> {
+  const { data } = await api.get<RequestLogDetail>(`/requests/${encodeURIComponent(id)}`)
   return data
 }

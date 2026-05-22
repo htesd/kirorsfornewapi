@@ -489,6 +489,10 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 该凭据的最大并发请求数
+    pub max_concurrency: u32,
+    /// 当前在用的并发数（max - 可用许可）
+    pub in_flight: u32,
 }
 
 /// 凭据管理器状态快照
@@ -607,7 +611,11 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
-                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        cred.max_concurrency
+                            .map(|n| n as usize)
+                            .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL),
+                    )),
                 }
             })
             .collect();
@@ -1489,6 +1497,15 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    max_concurrency: e
+                        .credentials
+                        .max_concurrency
+                        .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL as u32),
+                    in_flight: (e
+                        .credentials
+                        .max_concurrency
+                        .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL as u32))
+                    .saturating_sub(e.semaphore.available_permits() as u32),
                 })
                 .collect(),
             current_id,
@@ -1537,6 +1554,25 @@ impl MultiTokenManager {
         self.select_highest_priority();
         // 持久化更改
         self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据并发上限（运行时生效）
+    ///
+    /// 用一个新的 Semaphore 替换旧的；正在持有旧 permit 的请求会照常完成
+    /// （旧 Semaphore 通过 Arc 引用计数延续到所有 permit drop），
+    /// 新请求开始 acquire 时已是新 Semaphore。
+    pub fn set_max_concurrency(&self, id: u64, n: usize) -> anyhow::Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        entry.semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(n));
+        entry.credentials.max_concurrency = Some(n as u32);
+        drop(entries);
+        // 持久化（凭据级 maxConcurrency 字段）
+        self.persist_credentials().ok();
         Ok(())
     }
 

@@ -10,6 +10,7 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  setCredentialConcurrency,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +116,18 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 设置凭据并发上限
+export function useSetConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, maxConcurrency }: { id: number; maxConcurrency: number }) =>
+      setCredentialConcurrency(id, maxConcurrency),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

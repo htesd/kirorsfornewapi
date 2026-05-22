@@ -21,6 +21,8 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 请求日志 SQLite 路径（None = 日志被禁用）
+    pub log_db_path: Option<std::path::PathBuf>,
 }
 
 impl AdminState {
@@ -28,7 +30,13 @@ impl AdminState {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            log_db_path: None,
         }
+    }
+
+    pub fn with_log_db<P: Into<std::path::PathBuf>>(mut self, path: Option<P>) -> Self {
+        self.log_db_path = path.map(|p| p.into());
+        self
     }
 }
 

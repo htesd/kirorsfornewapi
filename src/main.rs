@@ -187,7 +187,13 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let log_db_path = if config.request_log.enabled {
+                Some(std::path::PathBuf::from(&config.request_log.db_path))
+            } else {
+                None
+            };
+            let admin_state = admin::AdminState::new(admin_key, admin_service)
+                .with_log_db(log_db_path);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

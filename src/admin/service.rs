@@ -125,6 +125,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 设置凭据并发上限
+    pub fn set_max_concurrency(&self, id: u64, n: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency(id, n as usize)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -235,6 +242,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            max_concurrency: None,
         };
 
         // 调用 token_manager 添加凭据

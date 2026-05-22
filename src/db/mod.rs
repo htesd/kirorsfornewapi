@@ -1,6 +1,7 @@
 //! 请求日志数据库模块
 
 mod config;
+pub mod query;
 mod recorder;
 mod schema;
 mod writer;

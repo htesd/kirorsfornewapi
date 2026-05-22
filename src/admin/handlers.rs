@@ -140,3 +140,127 @@ pub async fn set_load_balancing_mode(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+// ============================================================================
+// 请求日志查询
+// ============================================================================
+
+use axum::extract::Query;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRequestsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+/// GET /api/admin/requests?limit=50&offset=0&status=error&accountId=xxx
+pub async fn list_requests(
+    State(state): State<AdminState>,
+    Query(params): Query<ListRequestsQuery>,
+) -> impl IntoResponse {
+    use crate::db::query::{self, ListQuery};
+    let Some(path) = state.log_db_path.clone() else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "请求日志未启用"
+        }))).into_response();
+    };
+
+    let q = ListQuery {
+        limit: params.limit.unwrap_or(50).min(500),
+        offset: params.offset.unwrap_or(0),
+        status: params.status,
+        account_id: params.account_id,
+    };
+
+    // SQLite 阻塞操作，包到 spawn_blocking
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = query::open_readonly(&path)?;
+        let total = query::count(&conn, &q)?;
+        let items = query::list(&conn, &q)?;
+        Ok((total, items))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((total, items))) => Json(serde_json::json!({
+            "total": total,
+            "items": items,
+        })).into_response(),
+        Ok(Err(e)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": e.to_string()
+        }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("task panic: {}", e)
+        }))).into_response(),
+    }
+}
+
+/// GET /api/admin/requests/:id
+pub async fn get_request_detail(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use crate::db::query;
+    let Some(path) = state.log_db_path.clone() else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "请求日志未启用"
+        }))).into_response();
+    };
+
+    let id_clone = id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = query::open_readonly(&path)?;
+        Ok(query::get(&conn, &id_clone)?)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(detail))) => Json(detail).into_response(),
+        Ok(Ok(None)) => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("请求 {} 不存在", id)
+        }))).into_response(),
+        Ok(Err(e)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": e.to_string()
+        }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("task panic: {}", e)
+        }))).into_response(),
+    }
+}
+
+// ============================================================================
+// 凭据并发数管理
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyRequest {
+    pub max_concurrency: u32,
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyRequest>,
+) -> impl IntoResponse {
+    if payload.max_concurrency == 0 || payload.max_concurrency > 100 {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "max_concurrency 必须在 1..=100 之间"
+        }))).into_response();
+    }
+    match state.service.set_max_concurrency(id, payload.max_concurrency) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 并发上限已设为 {}", id, payload.max_concurrency
+        ))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}

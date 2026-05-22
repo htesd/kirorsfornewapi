@@ -27,6 +27,48 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  maxConcurrency: number
+  inFlight: number
+}
+
+// 请求日志列表项
+export interface RequestLogSummary {
+  requestId: string
+  tsMs: number
+  model: string
+  upstreamModel?: string
+  endpoint: string
+  accountId?: string
+  accountLabel?: string
+  status: string
+  httpStatus?: number
+  errorKind?: string
+  reason?: string
+  attempts: number
+  isStream: boolean
+  latencyMs: number
+  ttfbMs?: number
+  promptTokens?: number
+  completionTokens?: number
+  meteringUnit?: string
+  meteringUsage?: number
+  contextUsagePct?: number
+}
+
+export interface RequestLogDetail extends RequestLogSummary {
+  messagesCount?: number
+  toolsCount?: number
+  systemPromptLen?: number
+  hasCacheControl?: boolean
+  errorMessage?: string
+  errorStage?: string
+  requestBody?: string
+  responseBody?: string
+}
+
+export interface RequestLogListResponse {
+  total: number
+  items: RequestLogSummary[]
 }
 
 // 余额响应
