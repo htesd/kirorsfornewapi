@@ -414,6 +414,8 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 单号并发限制（每个凭据独立的 Semaphore）
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// 禁用原因
@@ -530,6 +532,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 每个凭据最大并发请求数（超过则跳过选下一个号）
+const MAX_CONCURRENCY_PER_CREDENTIAL: usize = 2;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -537,6 +541,8 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
+///
+/// 持有 `_permit` 期间占用该凭据的一个并发槽位，drop 时自动释放。
 #[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
@@ -545,6 +551,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 并发许可（drop 时自动归还 semaphore 槽位）
+    _permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl MultiTokenManager {
@@ -599,6 +607,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
                 }
             })
             .collect();
@@ -825,8 +834,31 @@ impl MultiTokenManager {
                 }
             };
 
+            // 尝试获取并发许可（满了就跳过这个号，重新选）
+            let permit = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.semaphore.clone())
+            };
+            let permit = match permit {
+                Some(sem) => match sem.clone().try_acquire_owned() {
+                    Ok(p) => std::sync::Arc::new(p),
+                    Err(_) => {
+                        tracing::debug!("凭据 #{} 并发已满（{}），跳过", id, MAX_CONCURRENCY_PER_CREDENTIAL);
+                        attempt_count += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    attempt_count += 1;
+                    continue;
+                }
+            };
+
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self.try_ensure_token(id, &credentials, permit).await {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
@@ -885,6 +917,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -896,6 +929,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _permit: permit,
             });
         }
 
@@ -965,6 +999,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _permit: permit,
         })
     }
 
@@ -1757,6 +1792,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
             });
         }
 
