@@ -313,11 +313,6 @@ pub async fn post_messages(
     // 记下映射后的 upstream model（如果转换层做了 model 映射）
     builder.set_upstream_model(payload.model.clone());
 
-    // 保存 Anthropic 端原始请求体（V1 始终保存，writer 端会按配置裁剪）
-    if let Ok(body_json) = serde_json::to_string(&payload) {
-        builder.set_request_body(body_json);
-    }
-
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -346,6 +341,9 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 保存 Kiro 格式请求体（writer 端按配置裁剪）
+    builder.set_request_body(request_body.clone());
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -896,9 +894,6 @@ pub async fn post_messages_cc(
     };
 
     builder.set_upstream_model(payload.model.clone());
-    if let Ok(body_json) = serde_json::to_string(&payload) {
-        builder.set_request_body(body_json);
-    }
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -914,6 +909,8 @@ pub async fn post_messages_cc(
         }
     };
 
+    builder.set_request_body(request_body.clone());
+
     tracing::debug!("Kiro request body: {}", request_body);
 
     let input_tokens = token::count_all_tokens(
@@ -922,16 +919,6 @@ pub async fn post_messages_cc(
     builder.set_prompt_tokens(input_tokens);
 
     let thinking_enabled = payload.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
-    let tool_name_map = conversion_result.tool_name_map;
-    ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {

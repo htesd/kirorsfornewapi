@@ -50,9 +50,11 @@ fn serialized_has_cache_control(payload: &MessagesRequest) -> bool {
             return true;
         }
     }
-    if let Ok(msgs) = serde_json::to_string(&payload.messages) {
-        if msgs.contains("cache_control") {
-            return true;
+    for msg in &payload.messages {
+        if let Ok(content_str) = serde_json::to_string(&msg.content) {
+            if content_str.contains("cache_control") {
+                return true;
+            }
         }
     }
     false
