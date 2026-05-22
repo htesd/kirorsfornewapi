@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::db::RequestLogConfig;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -109,6 +111,12 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 请求日志配置（SQLite 落盘）
+    ///
+    /// 默认启用、仅记错误、最多 2000 条。详见 [`RequestLogConfig`]。
+    #[serde(default)]
+    pub request_log: RequestLogConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -184,6 +192,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            request_log: RequestLogConfig::default(),
             config_path: None,
         }
     }

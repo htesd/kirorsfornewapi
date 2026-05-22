@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::common::auth;
+use crate::db::LogRecorder;
 use crate::kiro::provider::KiroProvider;
 
 use super::types::ErrorResponse;
@@ -25,6 +26,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 请求日志记录器（None = 日志被禁用）
+    pub log_recorder: Option<LogRecorder>,
 }
 
 impl AppState {
@@ -34,12 +37,19 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            log_recorder: None,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置日志记录器
+    pub fn with_log_recorder(mut self, recorder: Option<LogRecorder>) -> Self {
+        self.log_recorder = recorder;
         self
     }
 }

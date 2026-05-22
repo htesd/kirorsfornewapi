@@ -22,16 +22,34 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
+use super::logging;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use crate::db::{LogRecorder, RequestRecordBuilder, RequestStatus};
+
+/// 上游错误分类（用于日志的 error_kind 字段）
+fn classify_provider_error(err_str: &str) -> &'static str {
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        "context_window_full"
+    } else if err_str.contains("Input is too long") {
+        "input_too_long"
+    } else if err_str.contains("MONTHLY_REQUEST_COUNT") || err_str.contains("402") {
+        "quota_exhausted"
+    } else if err_str.contains("401") || err_str.contains("403") {
+        "auth_failed"
+    } else if err_str.contains("429") {
+        "rate_limited"
+    } else {
+        "upstream_error"
+    }
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
@@ -44,7 +62,6 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
         return (
@@ -65,6 +82,18 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+/// 调度失败时记录日志并返回 HTTP
+fn record_and_map_error(
+    err: Error,
+    builder: RequestRecordBuilder,
+    recorder: Option<&LogRecorder>,
+) -> Response {
+    let err_str = err.to_string();
+    let kind = classify_provider_error(&err_str);
+    logging::finish_with_error(recorder, builder, kind, "upstream", "dispatch", err_str);
+    map_provider_error(err)
 }
 
 /// GET /v1/models
@@ -204,11 +233,22 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    let recorder = state.log_recorder.clone();
+    let mut builder = logging::begin("/v1/messages", &payload);
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
+            logging::finish_with_error(
+                recorder.as_ref(),
+                builder,
+                "no_provider",
+                "config",
+                "503",
+                "KiroProvider 未配置",
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -235,6 +275,9 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
+        // V1：WebSearch 路径暂只记一条"成功调度"日志，不细化
+        builder.set_reason("websearch_routed");
+        logging::finish(recorder.as_ref(), builder, RequestStatus::Success);
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
@@ -251,6 +294,14 @@ pub async fn post_messages(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
+            logging::finish_with_error(
+                recorder.as_ref(),
+                builder,
+                "convert_failed",
+                "convert",
+                "400",
+                message.clone(),
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -258,6 +309,14 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 记下映射后的 upstream model（如果转换层做了 model 映射）
+    builder.set_upstream_model(payload.model.clone());
+
+    // 保存 Anthropic 端原始请求体（V1 始终保存，writer 端会按配置裁剪）
+    if let Ok(body_json) = serde_json::to_string(&payload) {
+        builder.set_request_body(body_json);
+    }
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -269,6 +328,14 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
+            logging::finish_with_error(
+                recorder.as_ref(),
+                builder,
+                "serialize_failed",
+                "convert",
+                "500",
+                e.to_string(),
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -289,6 +356,7 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
+    builder.set_prompt_tokens(input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -300,7 +368,6 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应
         handle_stream_request(
             provider,
             &request_body,
@@ -308,12 +375,23 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            builder,
+            recorder,
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            builder,
+            recorder,
+        )
+        .await
     }
 }
 
@@ -325,12 +403,21 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    mut builder: RequestRecordBuilder,
+    recorder: Option<LogRecorder>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+    let outcome = match provider.call_api_stream(request_body).await {
+        Ok(out) => out,
+        Err(e) => return record_and_map_error(e, builder, recorder.as_ref()),
     };
+    logging::observe_dispatch(&mut builder, &outcome);
+    let response = outcome.response;
+    tracing::debug!(
+        account_id = %outcome.account_id,
+        attempts = outcome.attempts,
+        "流式请求调度成功"
+    );
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
@@ -338,8 +425,8 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    // 创建 SSE 流（builder/recorder 在流结束时落库）
+    let stream = create_sse_stream(response, ctx, initial_events, builder, recorder);
 
     // 返回 SSE 响应
     Response::builder()
@@ -360,10 +447,16 @@ fn create_ping_sse() -> Bytes {
 }
 
 /// 创建 SSE 事件流
+///
+/// `builder` 和 `recorder` 在流结束（正常 / IO 错误 / 客户端断开）时
+/// 完成 RequestRecord 落库。`builder` 包装成 Option，take 后置 None
+/// 表示已经记过，后续 chunk 不再重复记。
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    builder: RequestRecordBuilder,
+    recorder: Option<LogRecorder>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -376,19 +469,29 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            Some(builder),
+            recorder,
+        ),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut builder, recorder)| async move {
             if finished {
                 return None;
             }
 
-            // 使用 select! 同时等待数据和 ping 定时器
             tokio::select! {
-                // 处理数据流
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            // 解码事件
+                            // 首字节到达：mark TTFB（仅第一次生效）
+                            if let Some(b) = builder.as_mut() {
+                                b.mark_ttfb();
+                            }
+
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
                             }
@@ -398,6 +501,10 @@ fn create_sse_stream(
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            // 观察事件，把 metering / context_usage 填进 builder
+                                            if let Some(b) = builder.as_mut() {
+                                                logging::observe_event(b, &event);
+                                            }
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -408,40 +515,51 @@ fn create_sse_stream(
                                 }
                             }
 
-                            // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, builder, recorder)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
+                            // 流 IO 错误：记 error
+                            if let Some(b) = builder.take() {
+                                logging::finish_with_error(
+                                    recorder.as_ref(),
+                                    b,
+                                    "stream_io",
+                                    "stream",
+                                    "io_error",
+                                    e.to_string(),
+                                );
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, builder, recorder)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            // 流正常结束：记 success
                             let final_events = ctx.generate_final_events();
+                            if let Some(b) = builder.take() {
+                                logging::finish(recorder.as_ref(), b, RequestStatus::Success);
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, builder, recorder)))
                         }
                     }
                 }
-                // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, builder, recorder)))
                 }
             }
         },
@@ -461,12 +579,21 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    mut builder: RequestRecordBuilder,
+    recorder: Option<LogRecorder>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+    let outcome = match provider.call_api(request_body).await {
+        Ok(out) => out,
+        Err(e) => return record_and_map_error(e, builder, recorder.as_ref()),
     };
+    logging::observe_dispatch(&mut builder, &outcome);
+    let response = outcome.response;
+    tracing::debug!(
+        account_id = %outcome.account_id,
+        attempts = outcome.attempts,
+        "非流式请求调度成功"
+    );
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -554,7 +681,7 @@ async fn handle_non_stream_request(
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            builder.set_context_usage_pct(context_usage.context_usage_percentage);
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
@@ -563,6 +690,9 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
+                        }
+                        Event::Metering(m) => {
+                            builder.set_metering(m.unit.clone(), m.usage);
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -634,6 +764,12 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         }
     });
+
+    // 落库
+    builder.set_prompt_tokens(final_input_tokens);
+    builder.set_completion_tokens(output_tokens);
+    builder.set_reason(&stop_reason);
+    logging::finish(recorder.as_ref(), builder, RequestStatus::Success);
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -716,63 +852,54 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    let recorder = state.log_recorder.clone();
+    let mut builder = logging::begin("/cc/v1/messages", &payload);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
+            logging::finish_with_error(
+                recorder.as_ref(), builder, "no_provider", "config", "503", "KiroProvider 未配置",
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
+                Json(ErrorResponse::new("service_unavailable", "Kiro API provider not configured")),
+            ).into_response();
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            payload.model.clone(), payload.system.clone(), payload.messages.clone(), payload.tools.clone(),
         ) as i32;
-
+        builder.set_reason("websearch_routed");
+        logging::finish(recorder.as_ref(), builder, RequestStatus::Success);
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    // 转换请求
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
+                ConversionError::UnsupportedModel(model) => ("invalid_request_error", format!("模型不支持: {}", model)),
+                ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
             };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            logging::finish_with_error(recorder.as_ref(), builder, "convert_failed", "convert", "400", message.clone());
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    builder.set_upstream_model(payload.model.clone());
+    if let Ok(body_json) = serde_json::to_string(&payload) {
+        builder.set_request_body(body_json);
+    }
+
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -782,25 +909,20 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+            logging::finish_with_error(recorder.as_ref(), builder, "serialize_failed", "convert", "500", e.to_string());
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("internal_error", format!("序列化请求失败: {}", e)))).into_response();
         }
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.model.clone(), payload.system, payload.messages, payload.tools,
+    ) as i32;
+    builder.set_prompt_tokens(input_tokens);
+
+    let thinking_enabled = payload.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
+    let tool_name_map = conversion_result.tool_name_map;
     ) as i32;
 
     // 检查是否启用了thinking
@@ -826,7 +948,7 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder).await
     }
 }
 
@@ -843,10 +965,16 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
+    let outcome = match provider.call_api_stream(request_body).await {
+        Ok(out) => out,
         Err(e) => return map_provider_error(e),
     };
+    let response = outcome.response;
+    tracing::debug!(
+        account_id = %outcome.account_id,
+        attempts = outcome.attempts,
+        "CC 缓冲流式请求调度成功"
+    );
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);

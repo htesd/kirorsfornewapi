@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::db::LogRecorder;
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -38,11 +39,13 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    log_recorder: Option<LogRecorder>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
+    state = state.with_log_recorder(log_recorder);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

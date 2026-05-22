@@ -25,6 +25,23 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// API 调用成功后的输出
+///
+/// 调度层把"用了哪张账号、retry 几次、HTTP 状态"等信息一并交还给 handler 层，
+/// 这样 handler 可以在 RequestRecord 里填上 `account_id` / `attempts` / `http_status`。
+pub struct CallOutcome {
+    pub response: reqwest::Response,
+    pub credential_id: u64,
+    /// 业务侧账号标识：优先用邮箱，回退到 "kiro-{id}"
+    pub account_id: String,
+    /// 订阅等级（KIRO PRO+ / KIRO FREE / ...）
+    pub account_label: Option<String>,
+    /// 第几次 attempt 成功（从 1 开始）
+    pub attempts: u32,
+    /// HTTP 状态码
+    pub http_status: u16,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -110,13 +127,14 @@ impl KiroProvider {
 
     /// 发送非流式 API 请求
     ///
-    /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
+    /// 返回值包含 `account_id` / `attempts` 等元信息，供日志层使用。
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<CallOutcome> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<CallOutcome> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -280,7 +298,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<CallOutcome> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -354,7 +372,20 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                let account_id = ctx
+                    .credentials
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| format!("kiro-{}", ctx.id));
+                let account_label = ctx.credentials.subscription_title.clone();
+                return Ok(CallOutcome {
+                    response,
+                    credential_id: ctx.id,
+                    account_id,
+                    account_label,
+                    attempts: (attempt + 1) as u32,
+                    http_status: status.as_u16(),
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
