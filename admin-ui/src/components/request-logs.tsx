@@ -154,15 +154,15 @@ function RequestRow({ r, onClick }: { r: RequestLogSummary; onClick: () => void 
       </td>
       <td className="px-3 py-2 text-right text-xs">
         {formatLatency(r.latencyMs)}
-        {r.ttfbMs !== undefined && <div className="text-xs text-muted-foreground">TTFB {formatLatency(r.ttfbMs)}</div>}
+        {r.ttfbMs != null && <div className="text-xs text-muted-foreground">TTFB {formatLatency(r.ttfbMs)}</div>}
       </td>
       <td className="px-3 py-2 text-right text-xs font-mono">{r.promptTokens ?? '-'}</td>
       <td className="px-3 py-2 text-right text-xs font-mono">{r.completionTokens ?? '-'}</td>
       <td className="px-3 py-2 text-right text-xs font-mono">
-        {r.meteringUsage !== undefined ? `${r.meteringUsage.toFixed(4)} ${r.meteringUnit ?? ''}` : '-'}
+        {r.meteringUsage != null ? `${r.meteringUsage.toFixed(4)} ${r.meteringUnit ?? ''}` : '-'}
       </td>
       <td className="px-3 py-2 text-right text-xs font-mono">
-        {r.contextUsagePct !== undefined ? `${r.contextUsagePct.toFixed(1)}%` : '-'}
+        {r.contextUsagePct != null ? `${r.contextUsagePct.toFixed(1)}%` : '-'}
       </td>
       <td className="px-3 py-2 text-xs text-red-500">{r.errorKind || ''}</td>
     </tr>
@@ -219,11 +219,11 @@ function DetailContent({ data }: { data: RequestLogDetail }) {
         <Field label="尝试次数" value={String(data.attempts)} />
         <Field label="结束原因" value={data.reason ?? '-'} />
         <Field label="耗时" value={formatLatency(data.latencyMs)} />
-        <Field label="TTFB" value={data.ttfbMs !== undefined ? formatLatency(data.ttfbMs) : '-'} />
+        <Field label="TTFB" value={data.ttfbMs != null ? formatLatency(data.ttfbMs) : '-'} />
         <Field label="输入 tokens" value={String(data.promptTokens ?? '-')} />
         <Field label="输出 tokens" value={String(data.completionTokens ?? '-')} />
-        <Field label="消耗" value={data.meteringUsage !== undefined ? `${data.meteringUsage.toFixed(4)} ${data.meteringUnit ?? ''}` : '-'} />
-        <Field label="上下文使用" value={data.contextUsagePct !== undefined ? `${data.contextUsagePct.toFixed(1)}%` : '-'} />
+        <Field label="消耗" value={data.meteringUsage != null ? `${data.meteringUsage.toFixed(4)} ${data.meteringUnit ?? ''}` : '-'} />
+        <Field label="上下文使用" value={data.contextUsagePct != null ? `${data.contextUsagePct.toFixed(1)}%` : '-'} />
         <Field label="messages 数" value={String(data.messagesCount ?? '-')} />
         <Field label="tools 数" value={String(data.toolsCount ?? '-')} />
         <Field label="system 长度" value={String(data.systemPromptLen ?? '-')} />

@@ -87,6 +87,8 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                max_concurrency: entry.max_concurrency,
+                in_flight: entry.in_flight,
             })
             .collect();
 

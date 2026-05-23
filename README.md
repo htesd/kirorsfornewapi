@@ -2,6 +2,19 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
+> ## 关于本 Fork (`htesd/kirorsfornewapi`)
+>
+> 本仓库在 upstream `hank9999/kiro.rs` 基础上做了几项面向 NewAPI 计费场景的扩展：
+>
+> 1. **SQLite 请求日志**（`src/db/`）：toggle errors-only / all 模式，环形缓冲限制 2000 条，记录 metering、context_usage、错误明细。Schema 已对齐 ALLinOne `UsageStore` 便于后续迁移到 Python。
+> 2. **每凭据并发限制**（`tokio::Semaphore`）：avoid "把单个号打到死" 的旧调度问题，默认每号 2 并发，可在 admin UI 调整。
+> 3. **conversationId 内容指纹**（`src/anthropic/converter.rs::derive_conversation_id_from_messages`）：
+>    Anthropic 客户端（Claude Code、curl 等）每次发完整 messages 数组，**没有 sessionId 概念**。upstream 实现 `unwrap_or_else(|| Uuid::new_v4().to_string())` 导致每次都是全新会话，Kiro 后端拿到的永远是 "新 conversation_id + 完整 history"，**无法做 prefix cache，token 全额计费**。
+>
+>    本 fork 用前 2 条 user 消息内容做 SHA-256 截 16 字节生成稳定 conversationId：同对话连续 turn 命中同一槽，`/compact` 后第一条 user 变了自然换槽。这是所有 Anthropic→AWS 系反代项目的共性问题（不是 kiro.rs 独有）。
+>
+> 4. **Admin UI 扩展**：请求日志查看页 + 每凭据并发数调整。
+
 ---
 
 <table>

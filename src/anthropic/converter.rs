@@ -179,6 +179,102 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 剥掉 Claude Code 客户端塞进 system prompt 里的 attribution header 行。
+///
+/// 现象：Claude Code 在 system prompt 里拼一行
+/// `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=<5位16进制>;`
+/// 其中 `cch` 是 Anthropic 服务端验证"请求来自真实 Claude Code 客户端"的 attribution
+/// token（参考 cc-haha/sub2api 实现：xxHash64 体哈希取低 20 bit）。
+///
+/// 对 Kiro / AWS CodeWhisperer 这条链路，这一行**完全无意义**：
+/// 1. Kiro 后端不读 anthropic 系的 attribution token
+/// 2. 占用 ~80 token 输入，每次请求都白花
+/// 3. cch 每请求都不同（因为是 body 哈希），即使 Kiro 真做基于 system prompt 完整哈希的
+///    prompt cache，这一行也会让命中率永远是 0
+///
+/// 处理：删除以 `x-anthropic-`（不区分大小写）开头的整行——保守覆盖该客户端可能注入的任何
+/// header-like 行。其他客户端不会包含这种格式，零误伤。
+fn strip_rolling_fingerprints(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        // 按字节比较前缀，避免 trimmed[..12] 在多字节字符（如 em-dash —）边界上 panic
+        if trimmed.len() >= 12 && trimmed.as_bytes()[..12].eq_ignore_ascii_case(b"x-anthropic-") {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+
+///
+/// Anthropic 客户端（如 Claude Code）通常不传 metadata.user_id 或不带 session_id，
+/// 导致每次都生成新 UUID，使 Kiro 后端无法做 prompt prefix cache，token 全额计费。
+///
+/// 取最早若干条 user 消息内容做 SHA-256，截 16 字节排成 UUID v4 形态。
+/// 同一对话的连续 turn 前缀稳定 → 命中同一 conversationId 槽。
+/// /compact 等真正重建上下文的场景，第一条 user 内容会变，自然换槽，符合语义。
+fn derive_conversation_id_from_messages(messages: &[super::types::Message]) -> String {
+    let mut hasher = Sha256::new();
+    // 取前 2 条 user 消息（一般是 system 之外最稳定的对话开场）
+    let mut taken = 0;
+    for msg in messages {
+        if msg.role == "user" {
+            // content 是 serde_json::Value，序列化后哈希
+            let s = serde_json::to_string(&msg.content).unwrap_or_default();
+            hasher.update(s.as_bytes());
+            hasher.update(b"\x00");
+            taken += 1;
+            if taken >= 2 {
+                break;
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    // 取前 16 字节排成 UUID 字符串（不强求真 v4 标志位，Kiro 只看字符串相等）
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 has 32 bytes");
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
+        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+        u64::from_be_bytes({
+            let mut b = [0u8; 8];
+            b[2..].copy_from_slice(&bytes[10..16]);
+            b
+        }) & 0x0000_ffff_ffff_ffff,
+    )
+}
+
+/// 基于 conversationId 派生 agentContinuationId。
+///
+/// 实测证据：5 次完全相同 payload，conversationId 都相同，但每次新生成 agentContinuationId 时
+/// Kiro 后端 prompt cache miss（首次 0.059，其余应低却出现 0.108）。当 agentContinuationId
+/// 在同会话内稳定，metering 立刻降到 0.038（~36% 折扣）。
+///
+/// 跟 conversationId 用同一种哈希派生方式，但加固定盐区分两个 ID，避免相等。
+fn derive_agent_continuation_id(conversation_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-continuation:");
+    hasher.update(conversation_id.as_bytes());
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 has 32 bytes");
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
+        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+        u64::from_be_bytes({
+            let mut b = [0u8; 8];
+            b[2..].copy_from_slice(&bytes[10..16]);
+            b
+        }) & 0x0000_ffff_ffff_ffff,
+    )
+}
+
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -243,13 +339,17 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 否则用消息前缀稳定哈希（避免每次新 UUID 导致 Kiro 后端无法做 prefix cache）
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+        .unwrap_or_else(|| derive_conversation_id_from_messages(messages));
+    // agentContinuationId 也必须稳定 —— 实测证据：同 conversationId 但每次新生成
+    // agentContinuationId 时 Kiro 后端 prompt cache miss、metering ~3 倍。
+    // 用 conversationId 派生（不同 UUID 但跟着对话走，让 Kiro 后端能稳定识别同一会话）。
+    let agent_continuation_id = derive_agent_continuation_id(&conversation_id);
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -659,7 +759,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     if let Some(ref system) = req.system {
         let system_content: String = system
             .iter()
-            .map(|s| s.text.clone())
+            .map(|s| strip_rolling_fingerprints(&s.text))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -897,14 +997,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_strip_rolling_fingerprints_multibyte_no_panic() {
+        // 回归：byte 12 落在 em-dash（3字节）中间时，旧实现 trimmed[..12] 会 panic。
+        let input = "**Step 1** — write the memory to its own file.\n";
+        assert_eq!(strip_rolling_fingerprints(input), input);
+    }
+
+    #[test]
+    fn test_strip_rolling_fingerprints_removes_anthropic_header() {
+        let input = "keep this line\nx-anthropic-billing-header: cch=abcde;\nkeep too\n";
+        let out = strip_rolling_fingerprints(input);
+        assert!(!out.contains("x-anthropic-"));
+        assert!(out.contains("keep this line"));
+        assert!(out.contains("keep too"));
+    }
+
+    #[test]
+    fn test_strip_rolling_fingerprints_case_insensitive_and_leading_ws() {
+        let input = "  X-Anthropic-Foo: bar\nplain\n";
+        let out = strip_rolling_fingerprints(input);
+        assert!(!out.to_ascii_lowercase().contains("x-anthropic-"));
+        assert!(out.contains("plain"));
+    }
+
+    #[test]
     fn test_map_model_sonnet() {
         assert!(
-            map_model("claude-sonnet-4-20250514")
+            map_model("claude-sonnet-4-5-20250929")
                 .unwrap()
                 .contains("sonnet")
         );
         assert!(
-            map_model("claude-3-5-sonnet-20241022")
+            map_model("claude-sonnet-4-6")
                 .unwrap()
                 .contains("sonnet")
         );
@@ -913,7 +1037,7 @@ mod tests {
     #[test]
     fn test_map_model_opus() {
         assert!(
-            map_model("claude-opus-4-20250514")
+            map_model("claude-opus-4-5")
                 .unwrap()
                 .contains("opus")
         );
@@ -965,7 +1089,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1069,7 +1193,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1119,7 +1243,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1182,7 +1306,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1281,7 +1405,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1313,7 +1437,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1720,7 +1844,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {

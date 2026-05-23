@@ -62,6 +62,10 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 该凭据的并发上限
+    pub max_concurrency: u32,
+    /// 当前正在该凭据上执行的请求数（已被 Semaphore 占用的 permit 数）
+    pub in_flight: u32,
 }
 
 // ============ 操作请求 ============

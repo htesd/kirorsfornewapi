@@ -345,6 +345,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            max_concurrency: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -463,6 +464,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            max_concurrency: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -494,6 +496,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            max_concurrency: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -608,6 +611,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            max_concurrency: None,
             kiro_api_key: None,
             endpoint: None,
         };
