@@ -13,7 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { RequestLogsPage } from '@/components/request-logs'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useRateLimitCooldown, useSetRateLimitCooldown } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -56,6 +56,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: cooldownData, isLoading: isLoadingCooldown } = useRateLimitCooldown()
+  const { mutate: setRateLimitCooldown, isPending: isSettingCooldown } = useSetRateLimitCooldown()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -509,6 +511,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  // 设置限流冷却时长（命中 429 后凭据自动停用多久）
+  const handleSetCooldown = () => {
+    const current = cooldownData?.cooldownSecs ?? 300
+    const input = window.prompt('命中 429 限流后，凭据自动停用多少秒（到点自动恢复）？', String(current))
+    if (input === null) return
+    const secs = Number(input.trim())
+    if (!Number.isFinite(secs) || secs < 0 || !Number.isInteger(secs)) {
+      toast.error('请输入非负整数秒数')
+      return
+    }
+    setRateLimitCooldown(secs, {
+      onSuccess: () => toast.success(`限流冷却已设为 ${secs}s`),
+      onError: (error) => toast.error(`设置失败: ${extractErrorMessage(error)}`),
+    })
+  }
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -555,6 +573,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
               title="切换负载均衡模式"
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSetCooldown}
+              disabled={isLoadingCooldown || isSettingCooldown}
+              title="命中 429 限流后，凭据自动停用的冷却时长（到点自动恢复）"
+            >
+              {isLoadingCooldown ? '加载中...' : `限流冷却 ${cooldownData?.cooldownSecs ?? 300}s`}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}

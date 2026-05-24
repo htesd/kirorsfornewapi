@@ -523,8 +523,10 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             let final_events = ctx.generate_final_events();
-                            // 流 IO 错误：记 error
-                            if let Some(b) = builder.take() {
+                            // 流 IO 错误：记 error（仍记录已产出的部分 token）
+                            if let Some(mut b) = builder.take() {
+                                b.set_prompt_tokens(ctx.context_input_tokens.unwrap_or(ctx.input_tokens));
+                                b.set_completion_tokens(ctx.output_tokens);
                                 logging::finish_with_error(
                                     recorder.as_ref(),
                                     b,
@@ -543,7 +545,11 @@ fn create_sse_stream(
                         None => {
                             // 流正常结束：记 success
                             let final_events = ctx.generate_final_events();
-                            if let Some(b) = builder.take() {
+                            if let Some(mut b) = builder.take() {
+                                // 把流式累计的 token 写进日志：output 是累计估算值，
+                                // input 优先用 contextUsageEvent 的真实值（与发给客户端的 message_delta 一致）
+                                b.set_prompt_tokens(ctx.context_input_tokens.unwrap_or(ctx.input_tokens));
+                                b.set_completion_tokens(ctx.output_tokens);
                                 logging::finish(recorder.as_ref(), b, RequestStatus::Success);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events

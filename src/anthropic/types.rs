@@ -248,6 +248,9 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// Anthropic 缓存控制（例如 `{"type": "ephemeral"}`），用于翻译成 Kiro cachePoint
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 图片数据源

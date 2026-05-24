@@ -93,6 +93,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 命中 429 限流后，自动停用该凭据的冷却时长（秒），到点自愈
+    #[serde(default = "default_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -159,6 +163,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_rate_limit_cooldown_secs() -> u64 {
+    300
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -189,6 +197,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

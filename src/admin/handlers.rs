@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetRateLimitCooldownRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/rate-limit-cooldown
+/// 获取限流冷却时长
+pub async fn get_rate_limit_cooldown(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_rate_limit_cooldown())
+}
+
+/// PUT /api/admin/config/rate-limit-cooldown
+/// 设置限流冷却时长
+pub async fn set_rate_limit_cooldown(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRateLimitCooldownRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rate_limit_cooldown(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

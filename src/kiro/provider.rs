@@ -465,9 +465,36 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 限流：立即临时停用当前凭据（按配置冷却，到点自愈）并切换到其他号
+            // （旧行为是重试同一个号，但 PRO+ 持续限流时反复打同号无意义）
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    "API 请求命中 429 限流（尝试 {}/{}），停用当前凭据并切换: {}",
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let has_available = self.token_manager.report_rate_limited(ctx.id);
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已限流/禁用）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+                continue;
+            }
+
+            // 408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            // （避免 502 high load 等瞬态错误把所有凭据锁死）
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,

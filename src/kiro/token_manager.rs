@@ -410,6 +410,8 @@ struct CredentialEntry {
     disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
     disabled_reason: Option<DisabledReason>,
+    /// 限流冷却到期时间（仅 RateLimited 用）：到点后在选号时自动自愈
+    disabled_until: Option<Instant>,
     /// API 调用成功次数
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -429,6 +431,8 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// 命中 429 限流，临时停用，冷却到期后自愈
+    RateLimited,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
@@ -528,6 +532,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 命中 429 后凭据自动停用的冷却时长（秒，运行时可修改）
+    rate_limit_cooldown_secs: Mutex<u64>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -609,6 +615,7 @@ impl MultiTokenManager {
                     } else {
                         None
                     },
+                    disabled_until: None,
                     success_count: 0,
                     last_used_at: None,
                     semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -661,6 +668,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let rate_limit_cooldown_secs = config.rate_limit_cooldown_secs;
         let manager = Self {
             config,
             proxy,
@@ -670,6 +678,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            rate_limit_cooldown_secs: Mutex::new(rate_limit_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -781,6 +790,23 @@ impl MultiTokenManager {
                     self.available_count(),
                     total
                 );
+            }
+
+            // 自愈：限流冷却已到期的凭据重新启用（在选号前 sweep）
+            {
+                let now = Instant::now();
+                let mut entries = self.entries.lock();
+                for e in entries.iter_mut() {
+                    if e.disabled
+                        && e.disabled_reason == Some(DisabledReason::RateLimited)
+                        && e.disabled_until.map(|t| now >= t).unwrap_or(true)
+                    {
+                        tracing::info!("凭据 #{} 限流冷却已到期，自动重新启用", e.id);
+                        e.disabled = false;
+                        e.disabled_reason = None;
+                        e.disabled_until = None;
+                    }
+                }
             }
 
             let (id, credentials) = {
@@ -1295,6 +1321,59 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据命中 429 限流。
+    ///
+    /// 与 quota 不同：这是**临时**停用，按 `rate_limit_cooldown_secs` 设置冷却时长，
+    /// 到点后在 `acquire_context` 选号时自动自愈（不需重启）。
+    /// - 立即禁用该凭据并记冷却到期时间
+    /// - 切换到下一个可用凭据继续重试
+    /// - 返回是否还有可用凭据
+    pub fn report_rate_limited(&self, id: u64) -> bool {
+        let cooldown_secs = *self.rate_limit_cooldown_secs.lock();
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            // 已被禁用（含手动/额度等）就不覆盖原因，只确保切走
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::RateLimited);
+            entry.disabled_until =
+                Some(Instant::now() + StdDuration::from_secs(cooldown_secs));
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            tracing::warn!(
+                "凭据 #{} 命中 429 限流，临时停用 {}s（冷却到期自动恢复）",
+                id,
+                cooldown_secs
+            );
+
+            // 切换到优先级最高的可用凭据
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!("已切换到凭据 #{}（优先级 {}）", next.id, next.credentials.priority);
+                true
+            } else {
+                tracing::warn!("所有凭据均已禁用（含限流冷却中）！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -1493,6 +1572,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyFailures => "TooManyFailures",
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
+                        DisabledReason::RateLimited => "RateLimited",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
@@ -1826,6 +1906,7 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
+                disabled_until: None,
                 success_count: 0,
                 last_used_at: None,
                 semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
@@ -1991,6 +2072,50 @@ impl MultiTokenManager {
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
+        Ok(())
+    }
+
+    /// 获取限流冷却时长（秒，Admin API）
+    pub fn get_rate_limit_cooldown_secs(&self) -> u64 {
+        *self.rate_limit_cooldown_secs.lock()
+    }
+
+    fn persist_rate_limit_cooldown_secs(&self, secs: u64) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，限流冷却时长仅在当前进程生效: {}s", secs);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.rate_limit_cooldown_secs = secs;
+        config
+            .save()
+            .with_context(|| format!("持久化限流冷却时长失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置限流冷却时长（秒，Admin API）
+    pub fn set_rate_limit_cooldown_secs(&self, secs: u64) -> anyhow::Result<()> {
+        let previous = self.get_rate_limit_cooldown_secs();
+        if previous == secs {
+            return Ok(());
+        }
+
+        *self.rate_limit_cooldown_secs.lock() = secs;
+
+        if let Err(err) = self.persist_rate_limit_cooldown_secs(secs) {
+            *self.rate_limit_cooldown_secs.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!("限流冷却时长已设置为: {}s", secs);
         Ok(())
     }
 }
@@ -2513,6 +2638,69 @@ mod tests {
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_report_rate_limited_disables_and_switches() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+        // 第一个 429：停用 #1，切到 #2，仍有可用
+        assert!(manager.report_rate_limited(1));
+        assert_eq!(manager.available_count(), 1);
+        // 第二个 429：停用 #2，已无可用
+        assert!(!manager.report_rate_limited(2));
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_revives_after_cooldown_zero() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = 0; // 立即到期
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_rate_limited(1);
+        manager.report_rate_limited(2);
+        assert_eq!(manager.available_count(), 0);
+
+        // 冷却为 0 已到期：acquire 时 sweep 自愈，应拿到 ctx 且可用数恢复
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert!(ctx.token == "t1" || ctx.token == "t2");
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_stays_disabled_within_cooldown() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = 3600; // 1 小时内不会自愈
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_rate_limited(1);
+        manager.report_rate_limited(2);
+        assert_eq!(manager.available_count(), 0);
+
+        // 冷却未到期：RateLimited 不参与 TooManyFailures 自愈，应仍失败
+        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        assert!(err.contains("所有凭据均已禁用"), "实际: {}", err);
         assert_eq!(manager.available_count(), 0);
     }
 

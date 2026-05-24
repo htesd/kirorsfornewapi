@@ -3,13 +3,91 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// 实验开关：把 tools 放进 history[0] 前缀（可被 Kiro prefix cache 缓存），
+/// 而非每轮全价重发的 currentMessage。由环境变量 `KIRO_TOOLS_IN_PREFIX=1` 启用。
+///
+/// 背景：tools(数万 token)放在 currentMessage 时排在增长的 history 之后，
+/// 永远落在"缓存分歧点之后"被全价重算。挪到 history[0] 理论上能进稳定前缀。
+/// **未验证 Kiro 后端是否仍会向当前轮提供这些工具**，故先做成开关、实测后再决定。
+fn tools_in_prefix_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRO_TOOLS_IN_PREFIX")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// 实验开关：将 Anthropic `cache_control` 翻译为 Kiro `cachePoint`。
+/// 由环境变量 `KIRO_CACHE_POINT=1` 启用。
+///
+/// 【2026-05-24 实测结论 —— 已证实是 no-op，默认保持关闭】
+/// 用独立可写 DB 做 A/B（多轮对话 + 唯一 nonce 冷启动，每配置连发 3 次）：
+///   - BASELINE（无 cachePoint）：冷 call cached=0 metering=0.0732，热 call cached=7100 metering=0.0394
+///   - cachePoint(type=default)  ：冷/热数字与 BASELINE **完全一致**
+/// 即 Kiro 按 conversationId 自动做 prefix-cache，显式 cachePoint marker 对缓存零影响。
+/// 另：`type` 必须是 `"default"`（Bedrock 约定），用 `EPHEMERAL`/`PERSISTENT` 会被
+/// Kiro 拒为 400 "Improperly formed request."。
+/// 真正降低输入的杠杆是「稳定 conversationId」（见本文件 derive_conversation_id_*），
+/// 不是 cachePoint。代码保留为 dormant 实验，供 Python 迁移参考，勿在 prod 开启。
+fn cache_point_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRO_CACHE_POINT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// 实验参数：cachePoint 的 type 值。默认 EPHEMERAL。
+/// 可设 "default" / "PERSISTENT" / "EPHEMERAL" 等以探测 Kiro 接受的枚举。
+fn cache_point_type() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| std::env::var("KIRO_CACHE_POINT_TYPE").unwrap_or_else(|_| "EPHEMERAL".to_string()))
+}
+
+/// 实验参数：是否附带 clientCacheConfig。默认 true。
+/// 设 `KIRO_CACHE_POINT_CONFIG=0` 可只发 cachePoint、不发 clientCacheConfig。
+fn cache_point_with_config() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRO_CACHE_POINT_CONFIG")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
+/// 实验参数：cachePoint 放置位置。默认 "current"（currentMessage）。
+/// 设 "history" 则改打在 history 最后一条 user 上（探测前缀缓存语义）。
+fn cache_point_placement() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| std::env::var("KIRO_CACHE_POINT_PLACE").unwrap_or_else(|_| "current".to_string()))
+}
+
+/// 检测 Anthropic 消息 content 中是否含有 `cache_control` 标记。
+///
+/// content 可能是 string 或 ContentBlock 数组。string 不会带 cache_control；
+/// 数组里只要任一 block 含 `cache_control`，即认为这条消息标记了"缓存到此处"。
+fn anthropic_message_has_cache_control(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::Array(arr) => arr.iter().any(|item| {
+            item.as_object()
+                .map(|obj| obj.contains_key("cache_control"))
+                .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
 use crate::kiro::model::requests::conversation::{
-    AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    AssistantMessage, CachePoint, ClientCacheConfig, ConversationState, CurrentMessage,
+    HistoryAssistantMessage, HistoryUserMessage, KiroImage, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -390,8 +468,23 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 11. 构建 UserInputMessageContext
+    // 工具放置策略：
+    // - 默认：放 currentMessage（每轮全价重发，无法缓存）
+    // - 实验开关开启且有历史用户消息：放 history[0] 前缀，进可缓存区
+    let place_in_history = tools_in_prefix_enabled()
+        && !tools.is_empty()
+        && matches!(history.first(), Some(Message::User(_)));
+
     let mut context = UserInputMessageContext::new();
-    if !tools.is_empty() {
+    if place_in_history {
+        if let Some(Message::User(h)) = history.first_mut() {
+            h.user_input_message.user_input_message_context.tools = std::mem::take(&mut tools);
+            tracing::info!(
+                "实验[tools_in_prefix]: {} 个工具已放入 history[0] 前缀（尝试命中缓存）",
+                h.user_input_message.user_input_message_context.tools.len()
+            );
+        }
+    } else if !tools.is_empty() {
         context = context.with_tools(tools);
     }
     if !validated_tool_results.is_empty() {
@@ -410,7 +503,41 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         user_input = user_input.with_images(images);
     }
 
+    // 实验：翻译 cache_control → cachePoint。env flag 控制，默认关闭。
+    let want_cache_point =
+        cache_point_enabled() && anthropic_message_has_cache_control(&last_message.content);
+    if want_cache_point && cache_point_placement() == "current" {
+        user_input.cache_point = Some(CachePoint::with_type(cache_point_type()));
+        if cache_point_with_config() {
+            user_input.client_cache_config = Some(ClientCacheConfig::default());
+        }
+        tracing::info!(
+            "实验[cache_point]: currentMessage 打 cachePoint type={} config={}",
+            cache_point_type(),
+            cache_point_with_config()
+        );
+    }
+
     let current_message = CurrentMessage::new(user_input);
+
+    // 实验变体：把 cachePoint 打在 history 最后一条 user 上（前缀缓存语义）。
+    if want_cache_point && cache_point_placement() == "history" {
+        if let Some(Message::User(h)) = history
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m, Message::User(_)))
+        {
+            h.user_input_message.cache_point = Some(CachePoint::with_type(cache_point_type()));
+            if cache_point_with_config() {
+                h.user_input_message.client_cache_config = Some(ClientCacheConfig::default());
+            }
+            tracing::info!(
+                "实验[cache_point]: history 末尾 user 打 cachePoint type={} config={}",
+                cache_point_type(),
+                cache_point_with_config()
+            );
+        }
+    }
 
     // 13. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
@@ -995,6 +1122,41 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_anthropic_message_has_cache_control_detects_block() {
+        let v = serde_json::json!([
+            {"type": "text", "text": "hi"},
+            {"type": "text", "text": "world", "cache_control": {"type": "ephemeral"}}
+        ]);
+        assert!(anthropic_message_has_cache_control(&v));
+    }
+
+    #[test]
+    fn test_anthropic_message_has_cache_control_absent() {
+        let v = serde_json::json!([{"type": "text", "text": "hi"}]);
+        assert!(!anthropic_message_has_cache_control(&v));
+        let v = serde_json::json!("plain string");
+        assert!(!anthropic_message_has_cache_control(&v));
+    }
+
+    #[test]
+    fn test_cache_point_serializes_compact_when_set() {
+        let mut um = UserInputMessage::new("hi", "claude-opus-4.7");
+        um.cache_point = Some(CachePoint::ephemeral());
+        um.client_cache_config = Some(ClientCacheConfig::default());
+        let json = serde_json::to_string(&um).unwrap();
+        assert!(json.contains("\"cachePoint\":{\"type\":\"EPHEMERAL\"}"));
+        assert!(json.contains("\"clientCacheConfig\":{\"usePromptCache\":true}"));
+    }
+
+    #[test]
+    fn test_cache_point_absent_field_omitted_by_default() {
+        let um = UserInputMessage::new("hi", "claude-opus-4.7");
+        let json = serde_json::to_string(&um).unwrap();
+        assert!(!json.contains("cachePoint"));
+        assert!(!json.contains("clientCacheConfig"));
+    }
 
     #[test]
     fn test_strip_rolling_fingerprints_multibyte_no_panic() {

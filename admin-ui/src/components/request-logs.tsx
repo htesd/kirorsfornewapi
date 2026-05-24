@@ -7,7 +7,8 @@ import { Badge } from '@/components/ui/badge'
 import { RefreshCw, X } from 'lucide-react'
 import type { RequestLogSummary, RequestLogDetail } from '@/types/api'
 
-const PAGE_SIZE = 50
+const PAGE_SIZE_OPTIONS = [50, 100, 200, 500]
+const DEFAULT_PAGE_SIZE = 100
 
 function formatTs(ms: number): string {
   return new Date(ms).toLocaleString()
@@ -16,6 +17,15 @@ function formatTs(ms: number): string {
 function formatLatency(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+// 缓存命中展示：undefined=无法判断, 0=未命中, >0=命中(显示估计的缓存读 token)
+function cacheCell(cachedTokens?: number) {
+  if (cachedTokens == null) return <span className="text-muted-foreground">-</span>
+  if (cachedTokens > 0) {
+    return <span className="text-green-600" title={`估计缓存读 ${cachedTokens} tokens`}>命中 {cachedTokens.toLocaleString()}</span>
+  }
+  return <span className="text-muted-foreground">miss</span>
 }
 
 function statusBadge(status: string) {
@@ -29,15 +39,16 @@ function statusBadge(status: string) {
 
 export function RequestLogsPage() {
   const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [statusFilter, setStatusFilter] = useState<string>('')
   const [accountFilter, setAccountFilter] = useState<string>('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   const { data, isLoading, refetch, isFetching } = useQuery({
-    queryKey: ['requests', page, statusFilter, accountFilter],
+    queryKey: ['requests', page, pageSize, statusFilter, accountFilter],
     queryFn: () => listRequests({
-      limit: PAGE_SIZE,
-      offset: page * PAGE_SIZE,
+      limit: pageSize,
+      offset: page * pageSize,
       status: statusFilter || undefined,
       accountId: accountFilter || undefined,
     }),
@@ -46,7 +57,7 @@ export function RequestLogsPage() {
 
   const total = data?.total ?? 0
   const items = data?.items ?? []
-  const totalPages = Math.ceil(total / PAGE_SIZE)
+  const totalPages = Math.ceil(total / pageSize)
 
   return (
     <div className="space-y-4">
@@ -69,6 +80,16 @@ export function RequestLogsPage() {
           onChange={(e) => { setAccountFilter(e.target.value); setPage(0) }}
           className="px-3 py-1.5 border rounded text-sm bg-background w-60"
         />
+        <select
+          value={pageSize}
+          onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0) }}
+          className="px-3 py-1.5 border rounded text-sm bg-background"
+          title="每页条数"
+        >
+          {PAGE_SIZE_OPTIONS.map((n) => (
+            <option key={n} value={n}>每页 {n}</option>
+          ))}
+        </select>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
           <RefreshCw className={`h-4 w-4 mr-2 ${isFetching ? 'animate-spin' : ''}`} />
           刷新
@@ -99,6 +120,7 @@ export function RequestLogsPage() {
                     <th className="px-3 py-2 text-right font-medium">输出</th>
                     <th className="px-3 py-2 text-right font-medium">消耗</th>
                     <th className="px-3 py-2 text-right font-medium">上下文%</th>
+                    <th className="px-3 py-2 text-center font-medium">缓存</th>
                     <th className="px-3 py-2 text-left font-medium">错误</th>
                   </tr>
                 </thead>
@@ -164,6 +186,7 @@ function RequestRow({ r, onClick }: { r: RequestLogSummary; onClick: () => void 
       <td className="px-3 py-2 text-right text-xs font-mono">
         {r.contextUsagePct != null ? `${r.contextUsagePct.toFixed(1)}%` : '-'}
       </td>
+      <td className="px-3 py-2 text-center text-xs font-mono">{cacheCell(r.cachedTokens)}</td>
       <td className="px-3 py-2 text-xs text-red-500">{r.errorKind || ''}</td>
     </tr>
   )
@@ -223,6 +246,7 @@ function DetailContent({ data }: { data: RequestLogDetail }) {
         <Field label="输入 tokens" value={String(data.promptTokens ?? '-')} />
         <Field label="输出 tokens" value={String(data.completionTokens ?? '-')} />
         <Field label="消耗" value={data.meteringUsage != null ? `${data.meteringUsage.toFixed(4)} ${data.meteringUnit ?? ''}` : '-'} />
+        <Field label="缓存命中" value={data.cachedTokens == null ? '-' : data.cachedTokens > 0 ? `命中 (缓存读 ~${data.cachedTokens.toLocaleString()})` : '未命中'} />
         <Field label="上下文使用" value={data.contextUsagePct != null ? `${data.contextUsagePct.toFixed(1)}%` : '-'} />
         <Field label="messages 数" value={String(data.messagesCount ?? '-')} />
         <Field label="tools 数" value={String(data.toolsCount ?? '-')} />

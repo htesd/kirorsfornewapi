@@ -107,6 +107,18 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   return data
 }
 
+// 获取限流冷却时长（秒）
+export async function getRateLimitCooldown(): Promise<{ cooldownSecs: number }> {
+  const { data } = await api.get<{ cooldownSecs: number }>('/config/rate-limit-cooldown')
+  return data
+}
+
+// 设置限流冷却时长（秒）
+export async function setRateLimitCooldown(cooldownSecs: number): Promise<{ cooldownSecs: number }> {
+  const { data } = await api.put<{ cooldownSecs: number }>('/config/rate-limit-cooldown', { cooldownSecs })
+  return data
+}
+
 // 设置凭据并发上限
 export async function setCredentialConcurrency(
   id: number,

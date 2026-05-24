@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getRateLimitCooldown,
+  setRateLimitCooldown,
   setCredentialConcurrency,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
@@ -116,6 +118,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取限流冷却时长
+export function useRateLimitCooldown() {
+  return useQuery({
+    queryKey: ['rateLimitCooldown'],
+    queryFn: getRateLimitCooldown,
+  })
+}
+
+// 设置限流冷却时长
+export function useSetRateLimitCooldown() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRateLimitCooldown,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rateLimitCooldown'] })
     },
   })
 }

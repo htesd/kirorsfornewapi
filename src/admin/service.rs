@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, RateLimitCooldownResponse,
+    SetLoadBalancingModeRequest, SetRateLimitCooldownRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -307,6 +308,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取限流冷却时长
+    pub fn get_rate_limit_cooldown(&self) -> RateLimitCooldownResponse {
+        RateLimitCooldownResponse {
+            cooldown_secs: self.token_manager.get_rate_limit_cooldown_secs(),
+        }
+    }
+
+    /// 设置限流冷却时长
+    pub fn set_rate_limit_cooldown(
+        &self,
+        req: SetRateLimitCooldownRequest,
+    ) -> Result<RateLimitCooldownResponse, AdminServiceError> {
+        self.token_manager
+            .set_rate_limit_cooldown_secs(req.cooldown_secs)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(RateLimitCooldownResponse {
+            cooldown_secs: req.cooldown_secs,
+        })
     }
 
     /// 强制刷新指定凭据的 Token

@@ -50,6 +50,7 @@ export interface RequestLogSummary {
   ttfbMs?: number
   promptTokens?: number
   completionTokens?: number
+  cachedTokens?: number
   meteringUnit?: string
   meteringUsage?: number
   contextUsagePct?: number

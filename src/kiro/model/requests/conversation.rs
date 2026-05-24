@@ -105,6 +105,12 @@ pub struct UserInputMessage {
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// 缓存标记点（翻译自 Anthropic cache_control，告诉 Kiro 后端这之前的内容必须缓存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
+    /// 客户端缓存配置（与 cache_point 配套使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cache_config: Option<ClientCacheConfig>,
 }
 
 impl UserInputMessage {
@@ -116,6 +122,8 @@ impl UserInputMessage {
             model_id: model_id.into(),
             images: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
+            cache_point: None,
+            client_cache_config: None,
         }
     }
 
@@ -246,6 +254,56 @@ pub struct UserMessage {
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
+    /// 缓存标记点（翻译自 Anthropic cache_control）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
+    /// 客户端缓存配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cache_config: Option<ClientCacheConfig>,
+}
+
+/// 缓存标记点
+///
+/// Kiro/CodeWhisperer 兼容字段，源自 Anthropic 协议的 `cache_control`。
+/// 告诉 Kiro 后端：这条消息（及之前的前缀）应当被缓存复用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePoint {
+    /// EPHEMERAL = 短期缓存（约 5 分钟，对齐 Anthropic 默认）
+    /// PERSISTENT = 长期缓存（约 1 小时）
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CachePoint {
+    pub fn ephemeral() -> Self {
+        Self {
+            cache_type: "EPHEMERAL".to_string(),
+        }
+    }
+
+    pub fn with_type(cache_type: impl Into<String>) -> Self {
+        Self {
+            cache_type: cache_type.into(),
+        }
+    }
+}
+
+/// 客户端缓存配置
+///
+/// 与 `cache_point` 配套使用，启用 prefix cache 机制。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCacheConfig {
+    pub use_prompt_cache: bool,
+}
+
+impl Default for ClientCacheConfig {
+    fn default() -> Self {
+        Self {
+            use_prompt_cache: true,
+        }
+    }
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
@@ -261,6 +319,8 @@ impl UserMessage {
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
+            cache_point: None,
+            client_cache_config: None,
         }
     }
 

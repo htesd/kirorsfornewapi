@@ -200,6 +200,22 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+/// 限流冷却时长响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitCooldownResponse {
+    /// 命中 429 后凭据自动停用的冷却时长（秒）
+    pub cooldown_secs: u64,
+}
+
+/// 设置限流冷却时长请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRateLimitCooldownRequest {
+    /// 冷却时长（秒）
+    pub cooldown_secs: u64,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -192,6 +192,24 @@ impl RequestRecordBuilder {
         &self.request_id
     }
 
+    // 只读访问器：供上层（logging glue）在 build 前做派生计算，
+    // 例如缓存命中估计。db 层本身不含任何计费/领域逻辑。
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+    pub fn prompt_tokens(&self) -> Option<i32> {
+        self.prompt_tokens
+    }
+    pub fn completion_tokens(&self) -> Option<i32> {
+        self.completion_tokens
+    }
+    pub fn metering_usage(&self) -> Option<f64> {
+        self.metering_usage
+    }
+    pub fn cached_tokens(&self) -> Option<i32> {
+        self.cached_tokens
+    }
+
     pub fn set_client_identity(
         &mut self,
         public_key_id: Option<String>,

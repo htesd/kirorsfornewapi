@@ -74,9 +74,38 @@ pub fn observe_event(builder: &mut RequestRecordBuilder, event: &Event) {
     match event {
         Event::Metering(m) => {
             builder.set_metering(m.unit.clone(), m.usage);
+            // 诊断：Kiro 的 meteringEvent 是否带 token 明细（input/output/cache）？
+            // 若有，可直接用其精确值替代估算。非空才打日志，避免噪声。
+            if !m.extra.is_empty() {
+                tracing::info!(usage = m.usage, "meteringEvent.extra: {:?}", m.extra);
+            }
         }
         Event::ContextUsage(c) => {
             builder.set_context_usage_pct(c.context_usage_percentage);
+        }
+        Event::TokenUsage(t) => {
+            // Kiro 精确 token 明细（含 thinking 与缓存读/写），覆盖估算值。
+            // - completion_tokens = outputTokens（含 thinking，不再低估）
+            // - cached_tokens     = cacheReadInputTokens（命中折扣部分）
+            // - cache_creation_tokens = cacheWriteInputTokens（写入缓存部分）
+            // - prompt_tokens     = uncached + cache_read（Kiro 实际计费的输入总量）
+            if t.output_tokens > 0 {
+                builder.set_completion_tokens(t.output_tokens as i32);
+            }
+            if let Some(cr) = t.cache_read_input_tokens {
+                builder.set_cached_tokens(cr as i32);
+            }
+            if let Some(cw) = t.cache_write_input_tokens {
+                builder.set_cache_creation_tokens(cw as i32);
+            }
+            let cache_read = t.cache_read_input_tokens.unwrap_or(0);
+            let real_input = t.uncached_input_tokens + cache_read;
+            if real_input > 0 {
+                builder.set_prompt_tokens(real_input as i32);
+            }
+            if !t.extra.is_empty() {
+                tracing::debug!("tokenUsageEvent.extra: {:?}", t.extra);
+            }
         }
         _ => {}
     }
@@ -85,14 +114,37 @@ pub fn observe_event(builder: &mut RequestRecordBuilder, event: &Event) {
 /// 终态：把 builder 落库（如果 recorder 存在）
 ///
 /// 调用方负责显式给 `status` —— 成功 / 错误 / 取消。
+///
+/// 落库前在此 glue 层做派生计算：用 metering + token 估计 Kiro 缓存命中，
+/// 把反推的 cache_read 写进 cached_tokens。领域逻辑在 `kiro::cache_estimate`，
+/// db 层保持纯持久化、不感知计费模型。
 pub fn finish(
     recorder: Option<&LogRecorder>,
-    builder: RequestRecordBuilder,
+    mut builder: RequestRecordBuilder,
     status: RequestStatus,
 ) {
     if let Some(rec) = recorder {
+        apply_cache_estimate(&mut builder);
         let record = builder.build(status);
         rec.record(record);
+    }
+}
+
+/// 用无缓存基线成本模型估计本次是否命中 Kiro prompt cache，
+/// 命中则把反推的 cache_read 写入 cached_tokens（NULL=无法判断，0=未命中，>0=命中）。
+fn apply_cache_estimate(builder: &mut RequestRecordBuilder) {
+    // 若 tokenUsageEvent 已写入精确的 cached_tokens，跳过估算
+    if builder.cached_tokens().is_some() {
+        return;
+    }
+    let (Some(prompt), Some(metering)) = (builder.prompt_tokens(), builder.metering_usage()) else {
+        return;
+    };
+    let output = builder.completion_tokens().unwrap_or(0);
+    if let Some(est) =
+        crate::kiro::cache_estimate::estimate(builder.model(), prompt, output, metering)
+    {
+        builder.set_cached_tokens(est.cache_read_tokens);
     }
 }
 

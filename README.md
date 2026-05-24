@@ -383,6 +383,51 @@ docker-compose up
 RUST_LOG=debug ./target/release/kiro-rs
 ```
 
+#### 实验性开关（默认全部关闭，生产勿开）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `KIRO_TOOLS_IN_PREFIX` | off | 把 tools 挪到 `history[0]` 前缀尝试进缓存区。**实测 Kiro 返回 400，已证伪** |
+| `KIRO_CACHE_POINT` | off | 把 Anthropic `cache_control` 翻译为 Kiro `cachePoint`。**实测 no-op，见下文「计费与缓存机制」** |
+| `KIRO_CACHE_POINT_TYPE` | `EPHEMERAL` | cachePoint 的 type；仅 `default` 被 Kiro 接受，其余值报 400 |
+| `KIRO_CACHE_POINT_CONFIG` | `1` | 是否附带 `clientCacheConfig` |
+| `KIRO_CACHE_POINT_PLACE` | `current` | cachePoint 放 `current`(当前消息) 还是 `history`(历史末尾 user) |
+
+## 计费与缓存机制（重要 —— Python 迁移必读）
+
+本分支的核心目标：让 NewAPI 等中转网关能按 Kiro 的真实 metering / 缓存正确计费。
+以下是 2026-05 期间逐项实测得出的关键结论。
+
+### 1. Kiro 按 `conversationId` 自动做 prefix-cache
+
+Anthropic API 客户端（Claude Code 等）每轮都发完整 messages，没有 sessionId。
+Kiro/CodeWhisperer 后端用 `conversationId` 跟踪会话做 prefix cache。
+
+- **务必让 `conversationId` 稳定**：本项目用「前 2 条 user 消息内容的 SHA-256」派生（见 `converter.rs::derive_conversation_id_from_messages`）。`agentContinuationId` 也必须稳定（由 conversationId 派生），否则实测 metering ~3 倍。
+- 一旦 conversationId 稳定，**Kiro 自动缓存生效**：实测同一会话冷启动 `cached=0`，第 2 轮起命中 ~68%（长对话可达 ~92%），metering 同步下降。
+- **这是降低输入成本的唯一有效杠杆。**
+
+### 2. `tokenUsageEvent` 给出精确 token（用于计费）
+
+Kiro 流式响应里有 `tokenUsageEvent`，字段：
+`uncachedInputTokens` / `outputTokens` / `totalTokens` / `cacheReadInputTokens` / `cacheWriteInputTokens`。
+
+- `prompt_tokens = uncachedInputTokens + cacheReadInputTokens`
+- `cached_tokens  = cacheReadInputTokens`
+- `completion_tokens = outputTokens`（已含 thinking）
+
+解析见 `kiro/model/events/token_usage.rs` + `anthropic/logging.rs`。有精确值时跳过启发式估算。
+
+### 3. `cachePoint` 翻译是 no-op（已证伪，勿在 Python 重做）
+
+尝试把 Anthropic `cache_control` 翻译成 Kiro `userInputMessage.cachePoint`，结论：
+
+- `type` 必须为 `"default"`；`EPHEMERAL`/`PERSISTENT` → 400 "Improperly formed request."。
+- 即使用 `default`，A/B 实测缓存命中、metering **与不发 cachePoint 完全一致** —— Kiro 接受该字段但忽略它，缓存完全由 `conversationId` 自动驱动。
+- 因此 `cache_control → cachePoint` **无收益**，代码仅作 dormant 实验保留（`KIRO_CACHE_POINT`）。
+
+> 一句话总结给 Python 迁移：**只需稳定 conversationId（拿自动缓存）+ 解析 tokenUsageEvent（拿精确计费）。不要碰 cachePoint，不要把 tools 挪进 history。**
+
 ## API 端点
 
 ### 标准端点 (/v1)

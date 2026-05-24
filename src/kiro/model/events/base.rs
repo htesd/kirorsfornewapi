@@ -16,6 +16,8 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// Token 用量事件（含 cacheRead/cacheWrite/output 精确明细）
+    TokenUsage,
     /// 未知事件类型
     Unknown,
 }
@@ -28,6 +30,7 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "tokenUsageEvent" => Self::TokenUsage,
             _ => Self::Unknown,
         }
     }
@@ -39,6 +42,7 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::TokenUsage => "tokenUsageEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -71,6 +75,8 @@ pub enum Event {
     Metering(super::MeteringEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// Token 用量明细（cacheRead/cacheWrite/output 等）
+    TokenUsage(super::TokenUsageEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -124,7 +130,24 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::TokenUsage => {
+                let payload = super::TokenUsageEvent::from_frame(&frame)?;
+                Ok(Self::TokenUsage(payload))
+            }
+            EventType::Unknown => {
+                // 一次性记录未知事件类型 + payload 摘要，便于发现 Kiro 后续新增的事件
+                let raw_type = frame.event_type().unwrap_or("");
+                if !raw_type.is_empty() && raw_type != "unknown" {
+                    let body = frame.payload_as_str();
+                    let snippet: String = body.chars().take(200).collect();
+                    tracing::info!(
+                        event_type = raw_type,
+                        payload_snippet = %snippet,
+                        "收到未识别的 Kiro 事件类型，已忽略（可能需要新增解析）"
+                    );
+                }
+                Ok(Self::Unknown {})
+            }
         }
     }
 
