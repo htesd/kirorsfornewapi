@@ -1,5 +1,32 @@
 # Changelog
 
+## [v16] - 2026-05-24
+### Fixes
+- **opencode(opus-4-6) 缓存计费缺失**：实测 Kiro 对 opus-4-6 不返回 `cacheReadInputTokens`
+  （tokenUsageEvent 缺该字段；thinking 不是原因——opus-4-7+thinking 照样有），导致缓存命中也
+  按全价计 NewAPI。`cache_estimate` 加 opus-4-6 基线 `(a=6.48e-6, b=112e-6, c=0)`（n=218 拟合
+  未命中样本），走估算回退填 `cached_tokens`。大会话命中反推 ~48%、未命中判 0，命中率 ~62%。
+- `base.rs` 加非内容事件的 debug 日志，排查不同模型/模式下 Kiro 实际发的计量事件。
+
+### Findings（缓存机制 diff 定位）
+- 相邻两轮 `request_body` diff：两个 agent 的 **history 都逐条字节一致**（Claude Code 1144 条、
+  opencode 344 条，新轮只追加），conversationId 稳定 —— **代理侧前缀已最优，无"上下文不一致"bug**。
+- **Kiro 不按我们发送的 JSON 字节序缓存**：Claude Code 字节 LCP≈0（字段序把每轮变的 currentMessage
+  排在 history 前）却仍命中 52% → Kiro 是 parse 后按 history 语义缓存。⇒ 改字节布局的招（cachePoint、
+  调字段序、搬 tools）对 Kiro 一律无效，这正是 cachePoint no-op 的根因。
+- **命中率 ~52% 是 Kiro 服务端缓存容量上限**：max_cached 随会话增长但比例递减（100k→~70%，
+  700k→~58%，封顶约 40 万 token）。客户端无法突破；降本只能缩短会话（产品决策）。
+
+### Notes & Caveats
+- **生产事故（已恢复）**：cachePoint 实验期间临时容器挂载了 prod 的 config 目录，导致 prod SQLite
+  被替换、writer 进程写已删除的孤儿 inode、新请求静默不落库、可见 DB 从 1633 条掉到 6 条。
+  靠 `/proc/<pid>/fd/` dump 孤儿 inode 抢救回全部 1633 条。教训：绝不让临时容器挂载 prod 数据目录。
+
+## [v15] - 2026-05-24
+### Features
+- Admin UI 请求日志页支持每页条数可选（50/100/200/500，默认 100），1633 条从 33 页降到 17/4 页。
+  后端 `limit` 上限 500 不变。
+
 ## [v14] - 2026-05-24
 ### Features
 - 接入 `tokenUsageEvent` 解析（`kiro/model/events/token_usage.rs`）：从 Kiro 流式响应拿精确的
