@@ -428,6 +428,29 @@ Kiro 流式响应里有 `tokenUsageEvent`，字段：
 
 > 一句话总结给 Python 迁移：**只需稳定 conversationId（拿自动缓存）+ 解析 tokenUsageEvent（拿精确计费）。不要碰 cachePoint，不要把 tools 挪进 history。**
 
+### 4. 命中率上限 ~52%：三方对照调查（2026-05-24）
+
+实测大会话命中率稳定在 ~52%（小会话更高、大会话更低，`max_cached` 约 40 万 token 封顶）。
+为确认"是不是漏了字段"，对照了两个同类项目 + 社区：
+
+| 维度 | 本项目 kiro.rs | AIClient-2-API | jwadow/kiro-gateway（成熟） |
+|------|------|------|------|
+| `conversationId` | 前 2 条 user 哈希，**同会话稳定** | 每次新 UUID | 默认随机 UUID（调用未传 messages）；传了也含"最后一条"每轮变 |
+| `agentContinuationId` | ✅ 有 | ❌ 无 | ❌ 无 |
+| `cacheReadInputTokens` | tokenUsageEvent 精确 + estimate 回退 | 硬编码 `0` | 读，但注释 *only forwarded when explicitly returned by upstream* |
+| `cache_control`/cachePoint | 实测证伪，dormant | 不发 | 注释 *not supported by Kiro*，直接丢弃 |
+
+**结论**：没有漏任何影响 prefix cache 的字段；本项目的 conversationId 稳定性 + agentContinuationId 是三者中最完整的。
+两个独立信源（kiro-gateway 源码注释）印证本项目结论：①`cache_control` 不被 Kiro 支持 → cachePoint 无效；
+②`cacheRead` 仅在 Kiro 显式返回时才有 → 解释 opus-4-6 缺该字段。社区（linux.do）多数实现是随机 UUID、
+**命中率≈0**（"hello 一下耗 0.5 刀"），本项目的 52% 已是生态最优；kiro-gateway 的 issues 里**无人讨论过命中率优化**。
+
+⇒ **52% 是 Kiro 服务端缓存上限，客户端无法突破。** 降本只能缩短会话（控制 prompt < ~40 万 token）。
+
+**唯一尚未验证的路径（TODO）**：抓 **kiro 官方 CLI** 的真实出站包，对比官方客户端是否发了任何我们/上述项目都没发的字段
+（如 workspaceState / supplementaryContext / 某 profile 维度），以及官方在长会话下的真实命中率是否也只有 ~52%。
+若官方也是 ~52%，则坐实为服务端上限；若官方更高，则抓包 diff 出差异字段即是突破口。
+
 ## API 端点
 
 ### 标准端点 (/v1)
