@@ -55,6 +55,13 @@ fn baseline_for(model: &str) -> Option<Baseline> {
     if has("opus") && v("4-7", "4.7") {
         // 生产数据拟合，n=155 短会话，R²≈0.79，可信
         Some(Baseline { a: 7.12e-6, b: 187.0e-6, c: 0.011 })
+    } else if has("opus") && v("4-6", "4.6") {
+        // opencode 走 opus-4-6(thinking)。实测 Kiro 对该模型**不报** cacheReadInputTokens
+        // (tokenUsageEvent 缺该字段)，导致命中也按全价计费 → 必须回退估算。
+        // n=218 迭代拟合未命中样本，强制 c=0（thinking output 未计入 completion，
+        // 其成本摊入 a；带 c 拟合会得 c≈0.16 把小请求误判成全命中，故弃用）。
+        // 命中率约 62%；大会话(成本重点)判定准：命中反推 cache_read ~48%、未命中判 0。
+        Some(Baseline { a: 6.48e-6, b: 112.0e-6, c: 0.0 })
     } else if has("sonnet") && v("4-5", "4.5") {
         // 短会话样本少(~10)，经验值，待更多数据重新拟合
         Some(Baseline { a: 6.5e-6, b: 130.0e-6, c: 0.0 })
@@ -143,6 +150,24 @@ mod tests {
     fn opus_short_fresh_request_is_miss() {
         // 短会话首轮：~20k 输入，无缓存预测≈0.191 credit，实测 ratio 中位≈0.95 → miss
         let e = estimate("claude-opus-4-7", 20000, 200, 0.181).unwrap();
+        assert!(!e.hit, "ratio={}", e.ratio);
+        assert_eq!(e.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn opus46_long_cached_request_is_hit() {
+        // opencode 大会话命中样本：160k 输入、618 输出、0.654 credit。
+        // 无缓存预测≈1.06，ratio≈0.61 → 命中，反推 cache_read 约一半输入。
+        let e = estimate("claude-opus-4-6-thinking", 160000, 618, 0.654).unwrap();
+        assert!(e.hit, "ratio={}", e.ratio);
+        assert!(e.cache_read_tokens > 60_000 && e.cache_read_tokens <= 160_000,
+            "cache_read={}", e.cache_read_tokens);
+    }
+
+    #[test]
+    fn opus46_long_uncached_request_is_miss() {
+        // 同规模未命中样本：160k 输入、618 输出、1.335 credit，ratio>1 → miss。
+        let e = estimate("claude-opus-4-6-thinking", 160000, 618, 1.335).unwrap();
         assert!(!e.hit, "ratio={}", e.ratio);
         assert_eq!(e.cache_read_tokens, 0);
     }

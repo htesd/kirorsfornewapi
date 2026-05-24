@@ -111,6 +111,11 @@ impl Event {
     /// 解析事件类型消息
     fn parse_event(frame: Frame) -> ParseResult<Self> {
         let event_type_str = frame.event_type().unwrap_or("unknown");
+        // 诊断：记录非内容事件帧（assistantResponse 逐 token 太吵，跳过）。
+        // 用于排查不同模型/模式(如 thinking)下 Kiro 实际发了哪些计量事件。
+        if event_type_str != "assistantResponseEvent" {
+            tracing::debug!(event_type = event_type_str, raw = %frame.payload_as_str(), "Kiro 事件帧");
+        }
         let event_type = EventType::from_str(event_type_str);
 
         match event_type {
