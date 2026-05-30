@@ -19,13 +19,19 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`
 }
 
-// 缓存命中展示：undefined=无法判断, 0=未命中, >0=命中(显示估计的缓存读 token)
-function cacheCell(cachedTokens?: number) {
-  if (cachedTokens == null) return <span className="text-muted-foreground">-</span>
-  if (cachedTokens > 0) {
-    return <span className="text-green-600" title={`估计缓存读 ${cachedTokens} tokens`}>命中 {cachedTokens.toLocaleString()}</span>
-  }
-  return <span className="text-muted-foreground">miss</span>
+// 缓存命中展示：上排=真实估算（DB cachedTokens），下排=实际发给 NewAPI 的值（cacheReadReported，受 perceived_cache_hit_ratio 放大）
+function cacheCell(cachedTokens?: number, reported?: number) {
+  const truthEl =
+    cachedTokens == null
+      ? <span className="text-muted-foreground">-</span>
+      : cachedTokens > 0
+        ? <span className="text-green-600" title={`真实估算 cache_read ${cachedTokens} tokens`}>真 {cachedTokens.toLocaleString()}</span>
+        : <span className="text-muted-foreground">miss</span>
+  const reportedEl =
+    reported == null
+      ? null
+      : <span className="text-blue-600 ml-1" title={`实报 NewAPI ${reported} tokens`}>报 {reported.toLocaleString()}</span>
+  return <div className="flex flex-col leading-tight">{truthEl}{reportedEl}</div>
 }
 
 function statusBadge(status: string) {
@@ -186,7 +192,7 @@ function RequestRow({ r, onClick }: { r: RequestLogSummary; onClick: () => void 
       <td className="px-3 py-2 text-right text-xs font-mono">
         {r.contextUsagePct != null ? `${r.contextUsagePct.toFixed(1)}%` : '-'}
       </td>
-      <td className="px-3 py-2 text-center text-xs font-mono">{cacheCell(r.cachedTokens)}</td>
+      <td className="px-3 py-2 text-center text-xs font-mono">{cacheCell(r.cachedTokens, r.cacheReadReported)}</td>
       <td className="px-3 py-2 text-xs text-red-500">{r.errorKind || ''}</td>
     </tr>
   )
@@ -246,7 +252,8 @@ function DetailContent({ data }: { data: RequestLogDetail }) {
         <Field label="输入 tokens" value={String(data.promptTokens ?? '-')} />
         <Field label="输出 tokens" value={String(data.completionTokens ?? '-')} />
         <Field label="消耗" value={data.meteringUsage != null ? `${data.meteringUsage.toFixed(4)} ${data.meteringUnit ?? ''}` : '-'} />
-        <Field label="缓存命中" value={data.cachedTokens == null ? '-' : data.cachedTokens > 0 ? `命中 (缓存读 ~${data.cachedTokens.toLocaleString()})` : '未命中'} />
+        <Field label="缓存命中（真实估算）" value={data.cachedTokens == null ? '-' : data.cachedTokens > 0 ? `命中 (~${data.cachedTokens.toLocaleString()} tokens)` : '未命中'} />
+        <Field label="缓存命中（实报 NewAPI）" value={data.cacheReadReported == null ? '-' : `${data.cacheReadReported.toLocaleString()} tokens`} />
         <Field label="上下文使用" value={data.contextUsagePct != null ? `${data.contextUsagePct.toFixed(1)}%` : '-'} />
         <Field label="messages 数" value={String(data.messagesCount ?? '-')} />
         <Field label="tools 数" value={String(data.toolsCount ?? '-')} />

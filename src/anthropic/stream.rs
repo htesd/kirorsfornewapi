@@ -458,6 +458,8 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read: i32,
+        cache_creation: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -475,7 +477,7 @@ impl SseStateManager {
             }
         }
 
-        // 发送 message_delta
+        // 发送 message_delta（usage 含 cache_read / cache_creation，>0 才写）
         if !self.message_delta_sent {
             self.message_delta_sent = true;
             events.push(SseEvent::new(
@@ -486,10 +488,9 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": super::usage::build_usage_json(
+                        input_tokens, output_tokens, cache_read, cache_creation,
+                    )
                 }),
             ));
         }
@@ -542,6 +543,17 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// Kiro tokenUsageEvent.cacheReadInputTokens（None = 未上报，走 cache_estimate 回退）
+    pub cache_read_input_tokens: Option<i32>,
+    /// Kiro tokenUsageEvent.cacheWriteInputTokens
+    pub cache_creation_input_tokens: Option<i32>,
+    /// Kiro meteringEvent.usage（cache_estimate 回退需要）
+    pub metering_usage: Option<f64>,
+    /// 用户感知缓存命中放大比例（None = 不放大）
+    pub perceived_cache_hit_ratio: Option<f64>,
+    /// 流结束时实际 emit 给 NewAPI 的 cache_read（generate_final_events 设置）
+    pub emitted_cache_read: Option<i32>,
+    pub emitted_cache_creation: Option<i32>,
 }
 
 impl StreamContext {
@@ -568,7 +580,18 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            metering_usage: None,
+            perceived_cache_hit_ratio: None,
+            emitted_cache_read: None,
+            emitted_cache_creation: None,
         }
+    }
+
+    /// 设置感知缓存命中放大比例
+    pub fn set_perceived_cache_hit_ratio(&mut self, r: Option<f64>) {
+        self.perceived_cache_hit_ratio = r;
     }
 
     /// 生成 message_start 事件
@@ -652,6 +675,27 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::TokenUsage(t) => {
+                // Kiro 精确 token 统计，含 cacheReadInputTokens（部分模型不报）
+                if let Some(cr) = t.cache_read_input_tokens {
+                    self.cache_read_input_tokens = Some(cr as i32);
+                }
+                if let Some(cw) = t.cache_write_input_tokens {
+                    self.cache_creation_input_tokens = Some(cw as i32);
+                }
+                // prompt 真值 = uncached + cacheRead，覆盖 contextUsage 推算
+                let total_input = t.uncached_input_tokens
+                    + t.cache_read_input_tokens.unwrap_or(0);
+                if total_input > 0 {
+                    self.context_input_tokens = Some(total_input as i32);
+                }
+                Vec::new()
+            }
+            Event::Metering(m) => {
+                // 留作 cache_estimate 回退（模型不报 cacheRead 时）
+                self.metering_usage = Some(m.usage);
                 Vec::new()
             }
             Event::Error {
@@ -1120,11 +1164,38 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
-        // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+        // 决定 cache_read：tokenUsageEvent 真值 > cache_estimate 回退 > 0
+        let raw_cache_read = self.cache_read_input_tokens.unwrap_or_else(|| {
+            self.metering_usage
+                .and_then(|m| {
+                    crate::kiro::cache_estimate::estimate(
+                        &self.model,
+                        final_input_tokens,
+                        self.output_tokens,
+                        m,
+                    )
+                })
+                .map(|e| e.cache_read_tokens)
+                .unwrap_or(0)
+        });
+        let cache_read = super::usage::inflate_cache_read(
+            final_input_tokens,
+            raw_cache_read,
+            self.perceived_cache_hit_ratio,
         );
+        let cache_creation = self.cache_creation_input_tokens.unwrap_or(0).max(0);
+
+        // 暴露给 SSE 流外层（写 DB 用），区分真实估算 vs 放大后实报
+        self.emitted_cache_read = Some(cache_read);
+        self.emitted_cache_creation = Some(cache_creation);
+
+        // 生成最终事件
+        events.extend(self.state_manager.generate_final_events(
+            final_input_tokens,
+            self.output_tokens,
+            cache_read,
+            cache_creation,
+        ));
         events
     }
 }
@@ -1166,6 +1237,11 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    /// 设置感知缓存命中放大比例（透传到内部 StreamContext）
+    pub fn set_perceived_cache_hit_ratio(&mut self, r: Option<f64>) {
+        self.inner.set_perceived_cache_hit_ratio(r);
     }
 
     /// 处理 Kiro 事件并缓冲结果

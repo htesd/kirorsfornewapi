@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, ListTree } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, ListTree, KeyRound } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,6 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { RequestLogsPage } from '@/components/request-logs'
+import { SettingsDialog } from '@/components/settings-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useRateLimitCooldown, useSetRateLimitCooldown } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -26,6 +27,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [activeTab, setActiveTab] = useState<'credentials' | 'logs'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -583,6 +585,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {isLoadingCooldown ? '加载中...' : `限流冷却 ${cooldownData?.cooldownSecs ?? 300}s`}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setSettingsDialogOpen(true)}
+              title="配置反代访问密钥（支持多个）"
+            >
+              <KeyRound className="h-4 w-4 mr-2" />
+              API Keys
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -807,6 +818,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
         </>
         )}
       </main>
+
+      {/* 反代 API Key 设置对话框 */}
+      <SettingsDialog
+        open={settingsDialogOpen}
+        onOpenChange={setSettingsDialogOpen}
+      />
 
       {/* 余额对话框 */}
       <BalanceDialog

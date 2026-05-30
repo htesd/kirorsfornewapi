@@ -159,6 +159,7 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
+        // 2026-05-29: Kiro 上游尚未支持 sonnet-4.8（INVALID_MODEL_ID），未来上线再加 4-8 分支
         if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
@@ -167,7 +168,10 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        // 2026-05-29: opus-4.8 已可用（Kiro 上游确认）
+        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
@@ -177,6 +181,7 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("haiku") {
+        // haiku 历史一直兜底到 4.5（Kiro 暂无更新版本，含 4.8）
         Some("claude-haiku-4.5".to_string())
     } else {
         None
@@ -190,7 +195,13 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 4.7 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" => 1_000_000,
+        Some(mapped) if mapped == "claude-sonnet-4.6"
+            || mapped == "claude-opus-4.6"
+            || mapped == "claude-opus-4.7"
+            || mapped == "claude-opus-4.8" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -589,8 +600,8 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                if let Some(img) = anthropic_image_to_kiro(&source) {
+                                    images.push(img);
                                 }
                             }
                         }
@@ -608,6 +619,9 @@ fn process_message_content(
                                     Some(if is_error { "error" } else { "success" }.to_string());
 
                                 tool_results.push(result);
+
+                                // 工具结果里也可能有图（如 browser 截图），单独抽出来
+                                images.extend(extract_images_from_tool_result_content(&block.content));
                             }
                         }
                         "tool_use" => {
@@ -633,6 +647,63 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/webp" => Some("webp".to_string()),
         _ => None,
     }
+}
+
+/// 把 Anthropic ImageSource 转为 KiroImage。
+///
+/// 当前支持：
+/// - `type: "base64"` + `data` + `media_type` → 直接转
+/// - `type: "url"` / `"file"` → 暂不支持（log warning，跳过），Kiro 需要 bytes，
+///   抓取/解析 file_id 需要异步 IO，留待后续 v21+ 改造为 async preprocessing 一步搞定。
+fn anthropic_image_to_kiro(source: &super::types::ImageSource) -> Option<crate::kiro::model::requests::conversation::KiroImage> {
+    match source.source_type.as_str() {
+        "base64" => {
+            let data = source.data.as_ref()?;
+            let media_type = source.media_type.as_deref()?;
+            let format = get_image_format(media_type)?;
+            Some(crate::kiro::model::requests::conversation::KiroImage::from_base64(format, data.clone()))
+        }
+        "url" => {
+            tracing::warn!(
+                url = source.url.as_deref().unwrap_or(""),
+                "暂不支持 URL 源图片，已跳过。客户端请把图片转 base64 再发送。"
+            );
+            None
+        }
+        "file" => {
+            tracing::warn!(
+                file_id = source.file_id.as_deref().unwrap_or(""),
+                "暂不支持 file_id 源图片，已跳过"
+            );
+            None
+        }
+        other => {
+            tracing::warn!(source_type = other, "未知图片源类型，已跳过");
+            None
+        }
+    }
+}
+
+/// 从 tool_result 的 content 数组里抽出 image 块（如 browser 工具的截图）。
+fn extract_images_from_tool_result_content(
+    content: &Option<serde_json::Value>,
+) -> Vec<crate::kiro::model::requests::conversation::KiroImage> {
+    let mut images = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = content {
+        for item in arr {
+            let block_type = item.get("type").and_then(|v| v.as_str());
+            if block_type == Some("image") {
+                if let Ok(src) = serde_json::from_value::<super::types::ImageSource>(
+                    item.get("source").cloned().unwrap_or(serde_json::Value::Null),
+                ) {
+                    if let Some(img) = anthropic_image_to_kiro(&src) {
+                        images.push(img);
+                    }
+                }
+            }
+        }
+    }
+    images
 }
 
 /// 提取工具结果内容
@@ -1261,6 +1332,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
@@ -1376,6 +1448,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -1439,6 +1512,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -1496,6 +1570,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -1584,6 +1659,7 @@ mod tests {
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
             }),
+            context_management: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -1612,6 +1688,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2042,6 +2119,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let result = convert_request(&req);

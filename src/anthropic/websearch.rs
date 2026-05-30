@@ -574,6 +574,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -612,6 +613,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -639,6 +641,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let query = extract_search_query(&req);
@@ -664,6 +667,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            context_management: None,
         };
 
         let query = extract_search_query(&req);

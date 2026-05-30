@@ -138,7 +138,8 @@ fn insert_record(
             prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, cost,
             metering_unit, metering_usage, context_usage_pct,
             has_cache_control, messages_count, tools_count, system_prompt_len,
-            params_json
+            params_json,
+            cache_read_reported
         ) VALUES (
             ?1, ?2,
             ?3, ?4, ?5,
@@ -150,7 +151,8 @@ fn insert_record(
             ?21, ?22, ?23, ?24, ?25,
             ?26, ?27, ?28,
             ?29, ?30, ?31, ?32,
-            ?33
+            ?33,
+            ?34
         )
         "#,
         params![
@@ -187,6 +189,7 @@ fn insert_record(
             rec.tools_count,
             rec.system_prompt_len,
             rec.params_json,
+            rec.cache_read_reported,
         ],
     )?;
 

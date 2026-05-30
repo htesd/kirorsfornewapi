@@ -1,5 +1,6 @@
 //! 请求日志数据库模块
 
+pub mod api_keys;
 mod config;
 pub mod query;
 mod recorder;

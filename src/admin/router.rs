@@ -7,11 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, get_rate_limit_cooldown,
-        get_request_detail, list_requests, reset_failure_count, set_credential_concurrency,
+        add_api_key, add_credential, delete_api_key, delete_credential, force_refresh_token,
+        get_all_credentials, get_credential_balance, get_load_balancing_mode,
+        get_rate_limit_cooldown, get_request_detail, get_scheduling, list_api_keys, list_requests,
+        reset_failure_count, set_api_key_disabled, set_credential_concurrency,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
-        set_rate_limit_cooldown,
+        set_rate_limit_cooldown, update_scheduling,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -40,6 +41,13 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/rate-limit-cooldown",
             get(get_rate_limit_cooldown).put(set_rate_limit_cooldown),
         )
+        .route(
+            "/config/scheduling",
+            get(get_scheduling).put(update_scheduling),
+        )
+        .route("/api-keys", get(list_api_keys).post(add_api_key))
+        .route("/api-keys/{id}", delete(delete_api_key))
+        .route("/api-keys/{id}/disabled", post(set_api_key_disabled))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

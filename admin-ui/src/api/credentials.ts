@@ -119,6 +119,63 @@ export async function setRateLimitCooldown(cooldownSecs: number): Promise<{ cool
   return data
 }
 
+// 调度策略（模式 + 冷却 + 会话亲和参数）
+export type SchedulingMode = 'priority' | 'balanced' | 'affinity'
+
+export interface Scheduling {
+  mode: SchedulingMode
+  cooldownSecs: number
+  affinityPromoteThreshold: number
+  affinityMapTtlSecs: number
+}
+
+export type UpdateSchedulingPayload = Partial<Scheduling>
+
+// 获取调度策略全部参数
+export async function getScheduling(): Promise<Scheduling> {
+  const { data } = await api.get<Scheduling>('/config/scheduling')
+  return data
+}
+
+// 更新调度策略（仅传需要改的字段）
+export async function updateScheduling(payload: UpdateSchedulingPayload): Promise<Scheduling> {
+  const { data } = await api.put<Scheduling>('/config/scheduling', payload)
+  return data
+}
+
+// 反代访问密钥（脱敏）
+export interface ApiKeyItem {
+  id: number
+  masked: string
+  label: string | null
+  createdAt: number
+  disabled: boolean
+}
+
+// 列出全部反代访问密钥
+export async function listApiKeys(): Promise<{ keys: ApiKeyItem[] }> {
+  const { data } = await api.get<{ keys: ApiKeyItem[] }>('/api-keys')
+  return data
+}
+
+// 新增反代访问密钥
+export async function addApiKey(key: string, label?: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/api-keys', { key, label })
+  return data
+}
+
+// 删除反代访问密钥
+export async function deleteApiKey(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/api-keys/${id}`)
+  return data
+}
+
+// 设置反代访问密钥的启用/禁用状态
+export async function setApiKeyDisabled(id: number, disabled: boolean): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/api-keys/${id}/disabled`, { disabled })
+  return data
+}
+
 // 设置凭据并发上限
 export async function setCredentialConcurrency(
   id: number,

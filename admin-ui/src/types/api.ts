@@ -51,6 +51,8 @@ export interface RequestLogSummary {
   promptTokens?: number
   completionTokens?: number
   cachedTokens?: number
+  /** 实际发给 NewAPI 的 cache_read（被 perceived_cache_hit_ratio 放大后的值） */
+  cacheReadReported?: number
   meteringUnit?: string
   meteringUsage?: number
   contextUsagePct?: number

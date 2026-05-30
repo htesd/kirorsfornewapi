@@ -70,7 +70,11 @@ pub struct RequestRecord {
     // Token
     pub prompt_tokens: Option<i32>,
     pub completion_tokens: Option<i32>,
+    /// 真实估算的 cache_read（tokenUsageEvent 或 cache_estimate 的判定值）
     pub cached_tokens: Option<i32>,
+    /// 实际发给 NewAPI 的 cache_read（被 perceived_cache_hit_ratio 放大后的值；
+    /// 与 cached_tokens 可能显著不同，方便对账）
+    pub cache_read_reported: Option<i32>,
     pub cache_creation_tokens: Option<i32>,
     pub cost: Option<f64>,
 
@@ -128,6 +132,7 @@ pub struct RequestRecordBuilder {
     prompt_tokens: Option<i32>,
     completion_tokens: Option<i32>,
     cached_tokens: Option<i32>,
+    cache_read_reported: Option<i32>,
     cache_creation_tokens: Option<i32>,
     cost: Option<f64>,
     metering_unit: Option<String>,
@@ -176,6 +181,7 @@ impl RequestRecordBuilder {
             prompt_tokens: None,
             completion_tokens: None,
             cached_tokens: None,
+            cache_read_reported: None,
             cache_creation_tokens: None,
             cost: None,
             metering_unit: None,
@@ -262,6 +268,9 @@ impl RequestRecordBuilder {
     pub fn set_cached_tokens(&mut self, n: i32) {
         self.cached_tokens = Some(n);
     }
+    pub fn set_cache_read_reported(&mut self, n: i32) {
+        self.cache_read_reported = Some(n);
+    }
     pub fn set_cache_creation_tokens(&mut self, n: i32) {
         self.cache_creation_tokens = Some(n);
     }
@@ -333,6 +342,7 @@ impl RequestRecordBuilder {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             cached_tokens: self.cached_tokens,
+            cache_read_reported: self.cache_read_reported,
             cache_creation_tokens: self.cache_creation_tokens,
             cost: self.cost,
             metering_unit: self.metering_unit,

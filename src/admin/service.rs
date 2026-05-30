@@ -15,7 +15,8 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, RateLimitCooldownResponse,
-    SetLoadBalancingModeRequest, SetRateLimitCooldownRequest,
+    SchedulingResponse, SetLoadBalancingModeRequest, SetRateLimitCooldownRequest,
+    UpdateSchedulingRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -297,9 +298,9 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode != "priority" && req.mode != "balanced" && req.mode != "affinity" {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority' / 'balanced' / 'affinity'".to_string(),
             ));
         }
 
@@ -308,6 +309,49 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取调度策略全部参数（供调度面板）
+    pub fn get_scheduling(&self) -> SchedulingResponse {
+        SchedulingResponse {
+            mode: self.token_manager.get_load_balancing_mode(),
+            cooldown_secs: self.token_manager.get_rate_limit_cooldown_secs(),
+            affinity_promote_threshold: self.token_manager.get_affinity_promote_threshold(),
+            affinity_map_ttl_secs: self.token_manager.get_affinity_map_ttl_secs(),
+        }
+    }
+
+    /// 更新调度策略（各字段可选，仅更新提供的项）
+    pub fn update_scheduling(
+        &self,
+        req: UpdateSchedulingRequest,
+    ) -> Result<SchedulingResponse, AdminServiceError> {
+        if let Some(mode) = req.mode {
+            if mode != "priority" && mode != "balanced" && mode != "affinity" {
+                return Err(AdminServiceError::InvalidCredential(
+                    "mode 必须是 'priority' / 'balanced' / 'affinity'".to_string(),
+                ));
+            }
+            self.token_manager
+                .set_load_balancing_mode(mode)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(secs) = req.cooldown_secs {
+            self.token_manager
+                .set_rate_limit_cooldown_secs(secs)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(k) = req.affinity_promote_threshold {
+            self.token_manager
+                .set_affinity_promote_threshold(k)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(ttl) = req.affinity_map_ttl_secs {
+            self.token_manager
+                .set_affinity_map_ttl_secs(ttl)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        Ok(self.get_scheduling())
     }
 
     /// 获取限流冷却时长

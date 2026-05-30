@@ -12,7 +12,13 @@ import {
   setLoadBalancingMode,
   getRateLimitCooldown,
   setRateLimitCooldown,
+  getScheduling,
+  updateScheduling,
   setCredentialConcurrency,
+  listApiKeys,
+  addApiKey,
+  deleteApiKey,
+  setApiKeyDisabled,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -137,6 +143,67 @@ export function useSetRateLimitCooldown() {
     mutationFn: setRateLimitCooldown,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['rateLimitCooldown'] })
+    },
+  })
+}
+
+// 获取调度策略（模式 + 冷却 + 会话亲和参数）
+export function useScheduling() {
+  return useQuery({
+    queryKey: ['scheduling'],
+    queryFn: getScheduling,
+  })
+}
+
+// 更新调度策略（仅传需要改的字段）
+export function useUpdateScheduling() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: updateScheduling,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scheduling'] })
+    },
+  })
+}
+
+// 列出反代访问密钥（脱敏）
+export function useApiKeys() {
+  return useQuery({
+    queryKey: ['apiKeys'],
+    queryFn: listApiKeys,
+  })
+}
+
+// 新增反代访问密钥
+export function useAddApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ key, label }: { key: string; label?: string }) => addApiKey(key, label),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// 删除反代访问密钥
+export function useDeleteApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteApiKey(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// 设置反代访问密钥的启用/禁用状态
+export function useSetApiKeyDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
+      setApiKeyDisabled(id, disabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
     },
   })
 }

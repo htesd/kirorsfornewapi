@@ -12,7 +12,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, SharedApiKeys, auth_middleware, cors_layer},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -36,16 +36,18 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    api_keys: SharedApiKeys,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     log_recorder: Option<LogRecorder>,
+    perceived_cache_hit_ratio: Option<f64>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_keys, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
     state = state.with_log_recorder(log_recorder);
+    state = state.with_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

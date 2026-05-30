@@ -42,6 +42,53 @@ pub struct CallOutcome {
     pub http_status: u16,
 }
 
+/// 上游 API 调用失败时的结构化错误
+///
+/// 携带"最后一次实际打的账号"信息，让 handler 在落库 error 日志时能填上
+/// `account_id` / `account_label` / `http_status`，而不是显示 "-"。
+/// 通过 `anyhow::Error::new(UpstreamCallError { .. })` 包装，下游用
+/// `err.downcast_ref::<UpstreamCallError>()` 提取。
+#[derive(Debug)]
+pub struct UpstreamCallError {
+    pub credential_id: Option<u64>,
+    pub account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub http_status: Option<u16>,
+    pub attempts: u32,
+    pub message: String,
+}
+
+impl std::fmt::Display for UpstreamCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for UpstreamCallError {}
+
+/// 构造 `UpstreamCallError` 包装的 anyhow::Error，附带最后尝试的账号 / HTTP 状态
+fn upstream_err(
+    ctx: &crate::kiro::token_manager::CallContext,
+    http_status: Option<u16>,
+    attempts: u32,
+    message: String,
+) -> anyhow::Error {
+    let account_id = ctx
+        .credentials
+        .email
+        .clone()
+        .unwrap_or_else(|| format!("kiro-{}", ctx.id));
+    let account_label = ctx.credentials.subscription_title.clone();
+    anyhow::Error::new(UpstreamCallError {
+        credential_id: Some(ctx.id),
+        account_id: Some(account_id),
+        account_label,
+        http_status,
+        attempts,
+        message,
+    })
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -307,10 +354,16 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 提取 conversationId 作 session 亲和键：同会话稳定锁同账号，命中 Kiro prefix cache
+        let session_key = Self::extract_conversation_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_with_session(model.as_deref(), session_key.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -359,7 +412,12 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    last_error = Some(upstream_err(
+                        &ctx,
+                        None,
+                        (attempt + 1) as u32,
+                        format!("API 请求发送失败: {}", e),
+                    ));
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -402,27 +460,36 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let status_code = status.as_u16();
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(upstream_err(
+                        &ctx,
+                        Some(status_code),
+                        (attempt + 1) as u32,
+                        format!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type, status, body
+                        ),
+                    ));
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
+                last_error = Some(upstream_err(
+                    &ctx,
+                    Some(status_code),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
                 ));
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(upstream_err(
+                    &ctx,
+                    Some(status.as_u16()),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
+                ));
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -447,20 +514,24 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                let status_code = status.as_u16();
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(upstream_err(
+                        &ctx,
+                        Some(status_code),
+                        (attempt + 1) as u32,
+                        format!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type, status, body
+                        ),
+                    ));
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
+                last_error = Some(upstream_err(
+                    &ctx,
+                    Some(status_code),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
                 ));
                 continue;
             }
@@ -475,19 +546,23 @@ impl KiroProvider {
                     body
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id);
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
+                let status_code = status.as_u16();
+                last_error = Some(upstream_err(
+                    &ctx,
+                    Some(status_code),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
                 ));
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已限流/禁用）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(upstream_err(
+                        &ctx,
+                        Some(status_code),
+                        (attempt + 1) as u32,
+                        format!(
+                            "{} API 请求失败（所有凭据已限流/禁用）: {} {}",
+                            api_type, status, body
+                        ),
+                    ));
                 }
                 continue;
             }
@@ -502,11 +577,11 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
+                last_error = Some(upstream_err(
+                    &ctx,
+                    Some(status.as_u16()),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -516,7 +591,12 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(upstream_err(
+                    &ctx,
+                    Some(status.as_u16()),
+                    (attempt + 1) as u32,
+                    format!("{} API 请求失败: {} {}", api_type, status, body),
+                ));
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -527,11 +607,11 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
+            last_error = Some(upstream_err(
+                &ctx,
+                Some(status.as_u16()),
+                (attempt + 1) as u32,
+                format!("{} API 请求失败: {} {}", api_type, status, body),
             ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
@@ -560,6 +640,19 @@ impl KiroProvider {
             .get("currentMessage")?
             .get("userInputMessage")?
             .get("modelId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// 从 Kiro 请求体里提取 conversationId（用作会话亲和的 session key）。
+    /// 该 id 由 converter::derive_conversation_id_from_messages 基于前 2 条 user 消息
+    /// 哈希得到，**同一会话连续 turn 之间稳定**，正好可做会话粘性路由的键。
+    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+        json.get("conversationState")?
+            .get("conversationId")?
             .as_str()
             .map(|s| s.to_string())
     }

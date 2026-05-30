@@ -78,11 +78,27 @@ async fn main() {
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
     tracing::debug!("主凭证: {:?}", first_credentials);
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
-        std::process::exit(1);
+    // 反代访问密钥（支持多个）：以 SQLite api_keys 表为准，Admin UI 可增删。
+    // 首次运行（表为空）时从 config.json 的 apiKey 播种一条，保证旧部署平滑升级。
+    let keys_db_path = std::path::PathBuf::from(&config.request_log.db_path);
+    let mut api_keys = db::api_keys::list_keys(&keys_db_path).unwrap_or_else(|e| {
+        tracing::warn!("读取 api_keys 表失败（回退 config.json）: {}", e);
+        Vec::new()
     });
+    if api_keys.is_empty() {
+        if let Some(k) = config.api_key.clone() {
+            if let Err(e) = db::api_keys::add(&keys_db_path, &k, Some("default")) {
+                tracing::warn!("播种 config.json apiKey 到 api_keys 表失败: {}", e);
+            }
+            api_keys.push(k);
+        }
+    }
+    if api_keys.is_empty() {
+        tracing::error!("未配置任何 apiKey（SQLite api_keys 表与 config.json 均无）");
+        std::process::exit(1);
+    }
+    let shared_api_keys: anthropic::SharedApiKeys =
+        Arc::new(parking_lot::RwLock::new(api_keys.clone()));
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -166,10 +182,11 @@ async fn main() {
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+        shared_api_keys.clone(),
         Some(kiro_provider),
         config.extract_thinking,
         log_recorder,
+        config.perceived_cache_hit_ratio,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -192,8 +209,13 @@ async fn main() {
             } else {
                 None
             };
-            let admin_state = admin::AdminState::new(admin_key, admin_service)
-                .with_log_db(log_db_path);
+            let admin_state = admin::AdminState::new(
+                admin_key,
+                admin_service,
+                shared_api_keys.clone(),
+                keys_db_path.clone(),
+            )
+            .with_log_db(log_db_path);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -212,7 +234,7 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    tracing::info!("已加载 {} 个反代 API Key", api_keys.len());
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");

@@ -97,12 +97,29 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
 
+    /// 会话亲和：次选连续命中多少次后转正为主账号（运行时可调）
+    #[serde(default = "default_affinity_promote_threshold")]
+    pub affinity_promote_threshold: u32,
+
+    /// 会话亲和映射的 TTL（秒，超时未活动则淘汰；运行时可调）
+    #[serde(default = "default_affinity_map_ttl_secs")]
+    pub affinity_map_ttl_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
     /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
+
+    /// 用户感知的缓存命中比例（可选，0.0-1.0；默认 None = 不放大，按实际/估算上报）
+    ///
+    /// 当一个请求被判定为命中且此值已配置时，会把 `cache_read_input_tokens`
+    /// 上报为 `max(实际命中, prompt_tokens × 此比例)`（夹到 prompt_tokens 上限）。
+    /// 用于在中转网关（NewAPI 等）一端把账单显示得更便宜，吸引用户。代理方承担
+    /// 与 Kiro 真实计费的差额。常用 0.92（即 92% 输入按缓存价计费）。
+    #[serde(default)]
+    pub perceived_cache_hit_ratio: Option<f64>,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -160,11 +177,19 @@ fn default_tls_backend() -> TlsBackend {
 }
 
 fn default_load_balancing_mode() -> String {
-    "priority".to_string()
+    "affinity".to_string()
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
     300
+}
+
+fn default_affinity_promote_threshold() -> u32 {
+    3
+}
+
+fn default_affinity_map_ttl_secs() -> u64 {
+    1800
 }
 
 fn default_extract_thinking() -> bool {
@@ -198,9 +223,12 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            affinity_promote_threshold: default_affinity_promote_threshold(),
+            affinity_map_ttl_secs: default_affinity_map_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            perceived_cache_hit_ratio: None,
             request_log: RequestLogConfig::default(),
             config_path: None,
         }

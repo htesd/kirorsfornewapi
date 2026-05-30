@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetRateLimitCooldownRequest, SuccessResponse,
+        AddApiKeyRequest, AddCredentialRequest, ApiKeyItem, ApiKeysResponse, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRateLimitCooldownRequest,
+        SuccessResponse, UpdateSchedulingRequest,
     },
 };
 
@@ -156,6 +157,238 @@ pub async fn set_rate_limit_cooldown(
     match state.service.set_rate_limit_cooldown(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/scheduling
+/// 获取调度策略全部参数（模式 + 冷却 + 亲和 K + 亲和 TTL）
+pub async fn get_scheduling(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_scheduling())
+}
+
+/// PUT /api/admin/config/scheduling
+/// 更新调度策略（各字段可选）
+pub async fn update_scheduling(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateSchedulingRequest>,
+) -> impl IntoResponse {
+    match state.service.update_scheduling(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============================================================================
+// 反代 API Key 配置（多 key）
+// ============================================================================
+
+/// 脱敏展示密钥：保留首 4、尾 2，中间用 `***` 代替；过短则全部隐藏
+fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "***".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{}***{}", head, tail)
+}
+
+/// 从 DB 重新加载 key 列表到内存句柄，保持两者一致
+async fn reload_keys_into_memory(state: &AdminState) {
+    let path = state.keys_db_path.clone();
+    if let Ok(Ok(keys)) =
+        tokio::task::spawn_blocking(move || crate::db::api_keys::list_keys(&path)).await
+    {
+        *state.api_keys.write() = keys;
+    }
+}
+
+/// GET /api/admin/api-keys
+/// 列出全部反代访问密钥（脱敏）
+pub async fn list_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::db::api_keys::list(&path)).await;
+
+    match result {
+        Ok(Ok(rows)) => {
+            let keys = rows
+                .into_iter()
+                .map(|r| ApiKeyItem {
+                    id: r.id,
+                    masked: mask_api_key(&r.key),
+                    label: r.label,
+                    created_at: r.created_at,
+                    disabled: r.disabled,
+                })
+                .collect();
+            Json(ApiKeysResponse { keys }).into_response()
+        }
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys
+/// 新增反代访问密钥：持久化到 SQLite + 立即更新内存句柄
+pub async fn add_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddApiKeyRequest>,
+) -> impl IntoResponse {
+    let key = payload.key.trim().to_string();
+    if key.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "key 不能为空" })),
+        )
+            .into_response();
+    }
+    let label = payload
+        .label
+        .and_then(|l| {
+            let t = l.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+
+    let path = state.keys_db_path.clone();
+    let key_for_db = key.clone();
+    let persist = tokio::task::spawn_blocking(move || {
+        crate::db::api_keys::add(&path, &key_for_db, label.as_deref())
+    })
+    .await;
+
+    match persist {
+        Ok(Ok(_id)) => {
+            reload_keys_into_memory(&state).await;
+            Json(SuccessResponse::new("API Key 已添加")).into_response()
+        }
+        Ok(Err(e)) => {
+            // UNIQUE 约束冲突 → 友好提示
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") || msg.contains("constraint") {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "该 API Key 已存在" })),
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("持久化失败: {}", msg) })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/api-keys/:id
+/// 删除反代访问密钥（保留至少一个，避免锁死）
+pub async fn delete_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let op = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let total = crate::db::api_keys::count(&path)?;
+        if total <= 1 {
+            anyhow::bail!("至少保留一个 API Key");
+        }
+        Ok(crate::db::api_keys::delete(&path, id)?)
+    })
+    .await;
+
+    match op {
+        Ok(Ok(0)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("API Key #{} 不存在", id) })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => {
+            reload_keys_into_memory(&state).await;
+            Json(SuccessResponse::new(format!("API Key #{} 已删除", id))).into_response()
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let code = if msg.contains("至少保留") {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys/:id/disabled
+/// 设置 API Key 启用/禁用状态。禁用后中间件认证立即不再匹配此 key。
+/// 至少要留一个**启用**的 key，否则反代会锁死自己。
+pub async fn set_api_key_disabled(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::admin::types::SetApiKeyDisabledRequest>,
+) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let want_disabled = payload.disabled;
+    let op = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        // 禁用前检查：禁用后是否还有启用的 key，没有就拒绝
+        if want_disabled {
+            let all = crate::db::api_keys::list(&path)?;
+            let still_enabled = all
+                .iter()
+                .filter(|r| !r.disabled && r.id != id)
+                .count();
+            if still_enabled == 0 {
+                anyhow::bail!("至少保留一个启用的 API Key");
+            }
+        }
+        Ok(crate::db::api_keys::set_disabled(&path, id, want_disabled)?)
+    })
+    .await;
+
+    match op {
+        Ok(Ok(0)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("API Key #{} 不存在", id) })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => {
+            reload_keys_into_memory(&state).await;
+            let action = if want_disabled { "禁用" } else { "启用" };
+            Json(SuccessResponse::new(format!("API Key #{} 已{}", id, action))).into_response()
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let code = if msg.contains("至少保留") {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
     }
 }
 

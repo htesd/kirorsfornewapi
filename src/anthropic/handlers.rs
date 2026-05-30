@@ -87,9 +87,20 @@ fn map_provider_error(err: Error) -> Response {
 /// 调度失败时记录日志并返回 HTTP
 fn record_and_map_error(
     err: Error,
-    builder: RequestRecordBuilder,
+    mut builder: RequestRecordBuilder,
     recorder: Option<&LogRecorder>,
 ) -> Response {
+    // 提取结构化的 UpstreamCallError（如果有），把账号 / HTTP 状态填进 builder，
+    // 避免 admin UI 里"账号 - 订阅 -"的空记录
+    if let Some(call_err) = err.downcast_ref::<crate::kiro::provider::UpstreamCallError>() {
+        if let Some(ref account_id) = call_err.account_id {
+            builder.set_account(account_id.clone(), call_err.account_label.clone());
+        }
+        if let Some(http) = call_err.http_status {
+            builder.set_http_status(http);
+        }
+        builder.set_attempts(call_err.attempts as i32);
+    }
     let err_str = err.to_string();
     let kind = classify_provider_error(&err_str);
     logging::finish_with_error(recorder, builder, kind, "upstream", "dispatch", err_str);
@@ -103,6 +114,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1780617600, // May 29, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1780617600, // May 29, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -263,6 +292,17 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    // Anthropic context-management beta（remote compact）：Kiro 不原生支持，proxy 侧裁剪
+    if payload.context_management.is_some() {
+        let prelim = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        super::context_management::apply(&mut payload, prelim);
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -375,6 +415,7 @@ pub async fn post_messages(
             tool_name_map,
             builder,
             recorder,
+            state.perceived_cache_hit_ratio,
         )
         .await
     } else {
@@ -388,6 +429,7 @@ pub async fn post_messages(
             tool_name_map,
             builder,
             recorder,
+            state.perceived_cache_hit_ratio,
         )
         .await
     }
@@ -403,6 +445,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     mut builder: RequestRecordBuilder,
     recorder: Option<LogRecorder>,
+    perceived_cache_hit_ratio: Option<f64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let outcome = match provider.call_api_stream(request_body).await {
@@ -419,6 +462,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -550,6 +594,9 @@ fn create_sse_stream(
                                 // input 优先用 contextUsageEvent 的真实值（与发给客户端的 message_delta 一致）
                                 b.set_prompt_tokens(ctx.context_input_tokens.unwrap_or(ctx.input_tokens));
                                 b.set_completion_tokens(ctx.output_tokens);
+                                if let Some(cr) = ctx.emitted_cache_read {
+                                    b.set_cache_read_reported(cr);
+                                }
                                 logging::finish(recorder.as_ref(), b, RequestStatus::Success);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -585,6 +632,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     mut builder: RequestRecordBuilder,
     recorder: Option<LogRecorder>,
+    perceived_cache_hit_ratio: Option<f64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let outcome = match provider.call_api(request_body).await {
@@ -627,6 +675,11 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // tokenUsageEvent 精确缓存读 / 缓存写 token 数
+    let mut cache_read_input_tokens: Option<i32> = None;
+    let mut cache_creation_input_tokens: Option<i32> = None;
+    // meteringEvent.usage（cache_estimate 回退）
+    let mut metering_usage: Option<f64> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -696,7 +749,22 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::Metering(m) => {
+                            metering_usage = Some(m.usage);
                             builder.set_metering(m.unit.clone(), m.usage);
+                        }
+                        Event::TokenUsage(t) => {
+                            if let Some(cr) = t.cache_read_input_tokens {
+                                cache_read_input_tokens = Some(cr as i32);
+                            }
+                            if let Some(cw) = t.cache_write_input_tokens {
+                                cache_creation_input_tokens = Some(cw as i32);
+                            }
+                            // 真值 prompt = uncached + cacheRead，覆盖 contextUsage 推算
+                            let total_input = t.uncached_input_tokens
+                                + t.cache_read_input_tokens.unwrap_or(0);
+                            if total_input > 0 {
+                                context_input_tokens = Some(total_input as i32);
+                            }
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -754,6 +822,22 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 决定 cache_read：tokenUsageEvent 真值 > cache_estimate 回退 > 0
+    let raw_cache_read = cache_read_input_tokens.unwrap_or_else(|| {
+        metering_usage
+            .and_then(|m| {
+                crate::kiro::cache_estimate::estimate(model, final_input_tokens, output_tokens, m)
+            })
+            .map(|e| e.cache_read_tokens)
+            .unwrap_or(0)
+    });
+    let cache_read = super::usage::inflate_cache_read(
+        final_input_tokens,
+        raw_cache_read,
+        perceived_cache_hit_ratio,
+    );
+    let cache_creation = cache_creation_input_tokens.unwrap_or(0).max(0);
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -763,16 +847,16 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": super::usage::build_usage_json(
+            final_input_tokens, output_tokens, cache_read, cache_creation,
+        )
     });
 
     // 落库
     builder.set_prompt_tokens(final_input_tokens);
     builder.set_completion_tokens(output_tokens);
     builder.set_reason(&stop_reason);
+    builder.set_cache_read_reported(cache_read);
     logging::finish(recorder.as_ref(), builder, RequestStatus::Success);
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -876,6 +960,14 @@ pub async fn post_messages_cc(
 
     override_thinking_from_model_name(&mut payload);
 
+    // Anthropic context-management beta（remote compact）：Kiro 不原生支持，proxy 侧裁剪
+    if payload.context_management.is_some() {
+        let prelim = token::count_all_tokens(
+            payload.model.clone(), payload.system.clone(), payload.messages.clone(), payload.tools.clone(),
+        ) as i32;
+        super::context_management::apply(&mut payload, prelim);
+    }
+
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
         let input_tokens = token::count_all_tokens(
@@ -936,12 +1028,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.perceived_cache_hit_ratio,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder, state.perceived_cache_hit_ratio).await
     }
 }
 
@@ -956,6 +1049,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    perceived_cache_hit_ratio: Option<f64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let outcome = match provider.call_api_stream(request_body).await {
@@ -970,7 +1064,8 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

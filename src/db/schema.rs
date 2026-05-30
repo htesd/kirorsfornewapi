@@ -133,8 +133,45 @@ pub fn init(conn: &Connection) -> SqlResult<()> {
             request_body   TEXT,
             response_body  TEXT
         );
+
+        -- 反代访问密钥（可配置多个，任意一个都能通过认证）。
+        -- 独立于 requests 环形缓冲，不会被 trim_to 清理。
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key         TEXT NOT NULL UNIQUE,
+            label       TEXT,
+            created_at  INTEGER NOT NULL
+        );
         "#,
     )?;
+
+    // v28 迁移：cache_read_reported = 实际发给 NewAPI 的 cache_read（被 perceived 比例放大后的值）。
+    // 注：`cached_tokens` 列继续记真实估算值（保留给未来重拟合 baseline 用），互不覆盖。
+    // ALTER TABLE ADD COLUMN 在 SQLite 不是幂等的，先 pragma 查一下再加。
+    let has_col: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'cache_read_reported'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_col == 0 {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_read_reported INTEGER",
+            [],
+        )?;
+    }
+
+    // v32 迁移：api_keys.disabled 列，支持禁用而不删除（保留 label/历史）
+    let has_disabled: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'disabled'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_disabled == 0 {
+        conn.execute(
+            "ALTER TABLE api_keys ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
 
     Ok(())
 }

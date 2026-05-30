@@ -128,6 +128,12 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// Anthropic context-management beta（"remote compact"）：上游应对历史做裁剪
+    /// 的指令，形如 `{edits:[{type:"clear_tool_uses_20250605", ...}]}`。
+    /// Kiro 后端不原生支持此能力（已对照同生态 kiro-gateway / AIClient-2-API 确认
+    /// 无人实现），收到时仅记日志、不报错——客户端通常会在本地回退应用同等裁剪。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<serde_json::Value>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -254,12 +260,25 @@ pub struct ContentBlock {
 }
 
 /// 图片数据源
+///
+/// Anthropic API 支持多种 source 形态：
+/// - `{type:"base64", media_type:"image/png", data:"..."}` ← 最常见，Kiro 直接吃
+/// - `{type:"url", url:"https://..."}` ← 较新，需要我们抓取后转 base64
+/// - `{type:"file", file_id:"..."}` ← 走 file API，目前不支持
+///
+/// 字段全部 optional 以确保各种形态都能反序列化成功（不再因缺字段把整个 image block 丢掉）。
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

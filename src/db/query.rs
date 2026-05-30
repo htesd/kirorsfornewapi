@@ -29,6 +29,8 @@ pub struct RequestLogSummary {
     pub completion_tokens: Option<i32>,
     /// 估计的缓存读 token（NULL=无法判断，0=未命中，>0=命中）
     pub cached_tokens: Option<i32>,
+    /// 实际发给 NewAPI 的 cache_read（perceived_cache_hit_ratio 放大后）
+    pub cache_read_reported: Option<i32>,
     pub metering_unit: Option<String>,
     pub metering_usage: Option<f64>,
     pub context_usage_pct: Option<f64>,
@@ -76,7 +78,7 @@ pub fn list(conn: &Connection, q: &ListQuery) -> SqlResult<Vec<RequestLogSummary
                 attempts, is_stream, latency_ms, ttfb_ms,
                 prompt_tokens, completion_tokens,
                 metering_unit, metering_usage, context_usage_pct,
-                cached_tokens
+                cached_tokens, cache_read_reported
          FROM requests",
     );
     let mut wheres = Vec::new();
@@ -122,6 +124,7 @@ pub fn list(conn: &Connection, q: &ListQuery) -> SqlResult<Vec<RequestLogSummary
             metering_usage: row.get(18)?,
             context_usage_pct: row.get(19)?,
             cached_tokens: row.get(20)?,
+            cache_read_reported: row.get(21)?,
         })
     })?;
     let mut out = Vec::new();
@@ -159,7 +162,7 @@ pub fn get(conn: &Connection, request_id: &str) -> SqlResult<Option<RequestLogDe
                 prompt_tokens, completion_tokens,
                 metering_unit, metering_usage, context_usage_pct,
                 messages_count, tools_count, system_prompt_len, has_cache_control,
-                error_message, cached_tokens
+                error_message, cached_tokens, cache_read_reported
          FROM requests WHERE request_id = ?",
         [request_id],
         |row| {
@@ -186,6 +189,7 @@ pub fn get(conn: &Connection, request_id: &str) -> SqlResult<Option<RequestLogDe
                     metering_usage: row.get(18)?,
                     context_usage_pct: row.get(19)?,
                     cached_tokens: row.get(25)?,
+                    cache_read_reported: row.get(26)?,
                 },
                 messages_count: row.get(20)?,
                 tools_count: row.get(21)?,

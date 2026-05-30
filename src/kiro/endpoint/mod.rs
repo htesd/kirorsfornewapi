@@ -70,11 +70,16 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 默认的"额度耗尽"判断逻辑
 ///
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
+/// 已知的 quota-exhausted reason：
+/// - `MONTHLY_REQUEST_COUNT`（账号月度额度归零）
+/// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`（超额额度也用完，"You have reached the limit for overages."）
+const QUOTA_REASONS: &[&str] = &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+    if QUOTA_REASONS.iter().any(|r| body.contains(r)) {
         return true;
     }
 
@@ -82,18 +87,16 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         return false;
     };
 
-    if value
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-    {
+    let matches_quota = |v: Option<&serde_json::Value>| -> bool {
+        v.and_then(|x| x.as_str())
+            .is_some_and(|s| QUOTA_REASONS.contains(&s))
+    };
+
+    if matches_quota(value.get("reason")) {
         return true;
     }
 
-    value
-        .pointer("/error/reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    matches_quota(value.pointer("/error/reason"))
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -121,6 +124,19 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_overage_limit_exceeded() {
+        // 真实 Kiro 上游响应（用户 2026-05-30 上报）
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_overage_limit_nested() {
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert!(default_is_monthly_request_limit(body));
     }
 
     #[test]

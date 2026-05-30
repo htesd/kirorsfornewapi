@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -396,6 +396,21 @@ pub(crate) async fn get_usage_limits(
 // 多凭据 Token 管理器
 // ============================================================================
 
+/// 会话亲和记录：session_key -> 选中的凭据（带 TTL 淘汰）
+///
+/// 行为：home(primary) 健康时一直用 primary（缓存热）；primary 冷却/不可用时
+/// 走稳定 alt；alt 连续命中达阈值则转正为 primary（排空热账号）。
+struct AffinityEntry {
+    /// 当前主账号
+    primary: u64,
+    /// 临时次选（主账号冷却/不可用时使用，整个冷却期固定，保次选缓存）
+    alt: Option<u64>,
+    /// 次选连续命中次数（达到阈值则转正）
+    alt_streak: u32,
+    /// 最后访问时间（用于 TTL 淘汰）
+    last_access: Instant,
+}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -416,6 +431,9 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 会话亲和 LRU 用：最后一次被选中的时刻（仅内存，选中即更新，
+    /// 用于"最久未调用优先"分配新会话；与 last_used_at 字符串解耦，精度更高）
+    last_selected_at: Option<Instant>,
     /// 单号并发限制（每个凭据独立的 Semaphore）
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -538,6 +556,12 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 会话亲和映射：session_key -> AffinityEntry（带 TTL 淘汰）
+    affinity_map: Mutex<HashMap<String, AffinityEntry>>,
+    /// 会话亲和：次选连续命中多少次后转正（运行时可调）
+    affinity_promote_threshold: AtomicU32,
+    /// 会话亲和映射 TTL（秒，运行时可调）
+    affinity_map_ttl_secs: AtomicU64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -618,6 +642,7 @@ impl MultiTokenManager {
                     disabled_until: None,
                     success_count: 0,
                     last_used_at: None,
+                    last_selected_at: None,
                     semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                         cred.max_concurrency
                             .map(|n| n as usize)
@@ -669,6 +694,8 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let rate_limit_cooldown_secs = config.rate_limit_cooldown_secs;
+        let affinity_promote_threshold = config.affinity_promote_threshold.max(1);
+        let affinity_map_ttl_secs = config.affinity_map_ttl_secs.max(1);
         let manager = Self {
             config,
             proxy,
@@ -681,6 +708,9 @@ impl MultiTokenManager {
             rate_limit_cooldown_secs: Mutex::new(rate_limit_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            affinity_map: Mutex::new(HashMap::new()),
+            affinity_promote_threshold: AtomicU32::new(affinity_promote_threshold),
+            affinity_map_ttl_secs: AtomicU64::new(affinity_map_ttl_secs),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -715,12 +745,127 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
+    /// 按 session_key 做有状态会话亲和选号（v3）。
+    ///
+    /// - 新会话：选 last_used_at 最旧（LRU，最久未调用）的合格凭据为 primary，写入映射。
+    /// - 老会话且 primary 健康：一直用 primary（缓存留在该账号，命中率最高）。
+    /// - primary 冷却/不可用：走稳定 alt（整个冷却期固定，保 alt 缓存）；alt 连续命中
+    ///   达 `affinity_promote_threshold` 次则转正为 primary —— 逐步排空热账号，
+    ///   避免所有会话反复抢同一个被限流的号。
+    /// - 映射按 `affinity_map_ttl_secs` 惰性淘汰。
+    ///
+    /// 不可用（disabled/冷却中/不支持模型/busy）的凭据天然被滤掉。
+    fn select_by_session_affinity(
+        &self,
+        model: Option<&str>,
+        session_key: &str,
+        exclude: &std::collections::HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let mut entries = self.entries.lock();
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        // 合格凭据的 id 集合（未禁用/支持模型/未 busy）
+        let eligible_ids: std::collections::HashSet<u64> = entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && (!is_opus || e.credentials.supports_opus())
+                    && !exclude.contains(&e.id)
+            })
+            .map(|e| e.id)
+            .collect();
+        if eligible_ids.is_empty() {
+            return None;
+        }
+
+        // LRU：在合格集合中选 last_selected_at 最旧（None 视为最久未用）
+        let lru_id = |ids: &std::collections::HashSet<u64>| -> u64 {
+            entries
+                .iter()
+                .filter(|e| ids.contains(&e.id))
+                .min_by(|a, b| match (a.last_selected_at, b.last_selected_at) {
+                    (None, None) => a.id.cmp(&b.id),
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(x), Some(y)) => x.cmp(&y),
+                })
+                .map(|e| e.id)
+                .unwrap()
+        };
+
+        let k = self
+            .affinity_promote_threshold
+            .load(Ordering::Relaxed)
+            .max(1);
+        let ttl =
+            StdDuration::from_secs(self.affinity_map_ttl_secs.load(Ordering::Relaxed).max(1));
+        let now = Instant::now();
+
+        let chosen_id = {
+            let mut map = self.affinity_map.lock();
+            map.retain(|_, v| now.duration_since(v.last_access) < ttl);
+
+            match map.get_mut(session_key) {
+                None => {
+                    let id = lru_id(&eligible_ids);
+                    map.insert(
+                        session_key.to_string(),
+                        AffinityEntry {
+                            primary: id,
+                            alt: None,
+                            alt_streak: 0,
+                            last_access: now,
+                        },
+                    );
+                    id
+                }
+                Some(ent) => {
+                    ent.last_access = now;
+                    if eligible_ids.contains(&ent.primary) {
+                        // home 健康 → 用 primary，丢弃临时 alt
+                        ent.alt = None;
+                        ent.alt_streak = 0;
+                        ent.primary
+                    } else {
+                        // home 冷却/不可用 → 稳定次选
+                        if ent.alt.map(|a| !eligible_ids.contains(&a)).unwrap_or(true) {
+                            ent.alt = Some(lru_id(&eligible_ids));
+                        }
+                        ent.alt_streak = ent.alt_streak.saturating_add(1);
+                        let alt = ent.alt.unwrap();
+                        if ent.alt_streak >= k {
+                            // 次选连续命中达阈值 → 转正，排空热账号
+                            ent.primary = alt;
+                            ent.alt = None;
+                            ent.alt_streak = 0;
+                        }
+                        alt
+                    }
+                }
+            }
+        };
+
+        // 选中即更新 last_selected_at（让 LRU 反映实时负载，新会话才会轮转）
+        if let Some(e) = entries.iter_mut().find(|e| e.id == chosen_id) {
+            e.last_selected_at = Some(now);
+            Some((e.id, e.credentials.clone()))
+        } else {
+            None
+        }
+    }
+
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        exclude: &std::collections::HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -737,6 +882,10 @@ impl MultiTokenManager {
                 }
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                // v31：排除已 permit 满的凭据（同一 acquire 调用内）
+                if exclude.contains(&e.id) {
                     return false;
                 }
                 true
@@ -779,9 +928,27 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_session(model, None).await
+    }
+
+    /// 带会话亲和的凭据获取：`session_key`（推荐用 conversationId）会让同一会话
+    /// 稳定锁到同一凭据，命中 Kiro 服务端 prefix cache。
+    ///
+    /// 实现：首次尝试用 HRW 哈希按 session_key 选号；该凭据被并发占满/瞬时不可用时，
+    /// 后续 attempt 降级到原 balanced/priority 选号逻辑，不会死锁。
+    pub async fn acquire_context_with_session(
+        &self,
+        model: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // 会话亲和只在第一次 attempt 应用；失败后降级走原逻辑，避免死循环
+        let mut session_affinity_tried = false;
+        // v31：本次 acquire 内已被 permit 拒绝的凭据集合（用于让 select 跳过它们，
+        // 防止 balanced/affinity 反复挑同一个忙账号到 max_attempts 报"无可用"假阳）
+        let mut busy_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         loop {
             if attempt_count >= max_attempts {
@@ -810,26 +977,44 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                let is_balanced = mode == "balanced";
+                let is_affinity = mode == "affinity";
+
+                // 会话亲和（仅 affinity 模式）：首次 attempt 按 session_key 选号，
+                // 让 Kiro 服务端 prefix cache 命中（同会话稳定锁同账号）
+                let session_hit = if is_affinity && !session_affinity_tried {
+                    session_affinity_tried = true;
+                    session_key.and_then(|key| {
+                        self.select_by_session_affinity(model, key, &busy_ids)
+                    })
+                } else {
+                    None
+                };
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
+                // priority 模式：优先使用 current_id 指向的凭据（但要避开 busy_ids）
+                let current_hit = session_hit.or_else(|| {
+                    if is_balanced {
+                        None
+                    } else {
+                        let entries = self.entries.lock();
+                        let current_id = *self.current_id.lock();
+                        if busy_ids.contains(&current_id) {
+                            return None;
+                        }
+                        entries
+                            .iter()
+                            .find(|e| e.id == current_id && !e.disabled)
+                            .map(|e| (e.id, e.credentials.clone()))
+                    }
+                });
 
                 if let Some(hit) = current_hit {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, &busy_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -848,7 +1033,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, &busy_ids);
                         }
                     }
 
@@ -858,12 +1043,30 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        // v31：区分"全 busy"和"全禁用"。前者不应该立即报错，
+                        // 短 sleep + 清空 busy_ids 让下一轮拿到刚释放的并发槽。
+                        let (available_not_busy, available_total) = {
+                            let entries = self.entries.lock();
+                            let total_avail = entries.iter().filter(|e| !e.disabled).count();
+                            let not_busy = entries
+                                .iter()
+                                .filter(|e| !e.disabled && !busy_ids.contains(&e.id))
+                                .count();
+                            (not_busy, total_avail)
+                        };
+                        if available_total > 0 && available_not_busy == 0 && !busy_ids.is_empty() {
+                            // 有可用账号但全部 busy → sleep 等并发释放
+                            tracing::debug!(
+                                "所有可用凭据并发已满（{}/{}），等待释放后重试",
+                                busy_ids.len(),
+                                available_total
+                            );
+                            drop(busy_ids.drain());
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            attempt_count += 1;
+                            continue;
+                        }
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available_total, total);
                     }
                 }
             };
@@ -881,11 +1084,15 @@ impl MultiTokenManager {
                     Ok(p) => std::sync::Arc::new(p),
                     Err(_) => {
                         tracing::debug!("凭据 #{} 并发已满（{}），跳过", id, MAX_CONCURRENCY_PER_CREDENTIAL);
+                        busy_ids.insert(id);
                         attempt_count += 1;
+                        // 重新允许 session affinity 在 busy 被释放后重试（如果 busy 集合清空了）
+                        session_affinity_tried = false;
                         continue;
                     }
                 },
                 None => {
+                    busy_ids.insert(id);
                     attempt_count += 1;
                     continue;
                 }
@@ -1318,6 +1525,11 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        // 额度耗尽是永久状态，回写 credentials.json 让容器重启后仍保持禁用
+        // （429 限流是临时的，所以不在 report_rate_limited 里 persist）
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("回写凭据文件失败（quota_exhausted 持久化）: {}", e);
+        }
         result
     }
 
@@ -1909,6 +2121,7 @@ impl MultiTokenManager {
                 disabled_until: None,
                 success_count: 0,
                 last_used_at: None,
+                last_selected_at: None,
                 semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
             });
         }
@@ -2055,7 +2268,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "affinity" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2116,6 +2329,68 @@ impl MultiTokenManager {
         }
 
         tracing::info!("限流冷却时长已设置为: {}s", secs);
+        Ok(())
+    }
+
+    /// 获取会话亲和"次选转正"阈值 K（Admin API）
+    pub fn get_affinity_promote_threshold(&self) -> u32 {
+        self.affinity_promote_threshold.load(Ordering::Relaxed)
+    }
+
+    /// 设置会话亲和"次选转正"阈值 K（Admin API，clamp 到 [1,20]）
+    pub fn set_affinity_promote_threshold(&self, k: u32) -> anyhow::Result<()> {
+        let k = k.clamp(1, 20);
+        let previous = self.get_affinity_promote_threshold();
+        if previous == k {
+            return Ok(());
+        }
+        self.affinity_promote_threshold.store(k, Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.affinity_promote_threshold = k) {
+            self.affinity_promote_threshold
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("会话亲和 K（次选转正阈值）已设置为: {}", k);
+        Ok(())
+    }
+
+    /// 获取会话亲和映射 TTL（秒，Admin API）
+    pub fn get_affinity_map_ttl_secs(&self) -> u64 {
+        self.affinity_map_ttl_secs.load(Ordering::Relaxed)
+    }
+
+    /// 设置会话亲和映射 TTL（秒，Admin API，clamp 到 [60,86400]）
+    pub fn set_affinity_map_ttl_secs(&self, secs: u64) -> anyhow::Result<()> {
+        let secs = secs.clamp(60, 86400);
+        let previous = self.get_affinity_map_ttl_secs();
+        if previous == secs {
+            return Ok(());
+        }
+        self.affinity_map_ttl_secs.store(secs, Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.affinity_map_ttl_secs = secs) {
+            self.affinity_map_ttl_secs.store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("会话亲和映射 TTL 已设置为: {}s", secs);
+        Ok(())
+    }
+
+    /// 通用：重新加载配置文件、应用一处修改、回写（用于运行时可调参数持久化）
+    fn persist_config_field<F: FnOnce(&mut Config)>(&self, apply: F) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，参数仅在当前进程生效");
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        apply(&mut config);
+        config
+            .save()
+            .with_context(|| format!("持久化配置失败: {}", config_path.display()))?;
         Ok(())
     }
 }
@@ -2452,6 +2727,171 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn session_affinity_same_key_picks_same_credential() {
+        // 3 个凭据，同一 session_key 应稳定选同一个；不同 key 大概率选不同的
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        let k1_first = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        // 100 次同 key 调用都应返回同一 id
+        for _ in 0..100 {
+            let id = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+            assert_eq!(id, k1_first, "同 session_key 必须稳定");
+        }
+    }
+
+    #[test]
+    fn session_affinity_distributes_different_keys() {
+        // 不同 session_key 应在多个凭据上分布（不全打一个）
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        let mut distinct_ids = std::collections::HashSet::new();
+        for i in 0..50 {
+            let key = format!("conv-{}", i);
+            distinct_ids.insert(manager.select_by_session_affinity(None, &key, &std::collections::HashSet::new()).unwrap().0);
+        }
+        // 3 个凭据，50 个 key，应至少打到 2 个以上（LRU 轮转分布）
+        assert!(
+            distinct_ids.len() >= 2,
+            "session_key 分布过窄：{:?}",
+            distinct_ids
+        );
+    }
+
+    #[test]
+    fn session_affinity_skips_busy_ids() {
+        // v31 修复：busy_ids 里的凭据必须被跳过，否则同会话高并发时死循环
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        let normal = manager
+            .select_by_session_affinity(None, "conv-x", &std::collections::HashSet::new())
+            .unwrap()
+            .0;
+        // 把首次选中的 primary 加入 busy → 同会话应换到稳定次选
+        let mut busy = std::collections::HashSet::new();
+        busy.insert(normal);
+        let alt = manager
+            .select_by_session_affinity(None, "conv-x", &busy)
+            .unwrap()
+            .0;
+        assert_ne!(alt, normal);
+
+        // select_next_credential 也应跳过 busy
+        let next_avoiding = manager.select_next_credential(None, &busy).unwrap().0;
+        assert_ne!(next_avoiding, normal);
+
+        // 全部加入 busy → 返回 None（主循环此时会 sleep 等待并发释放）
+        for id in [1u64, 2, 3] {
+            busy.insert(id);
+        }
+        assert!(manager.select_next_credential(None, &busy).is_none());
+        assert!(manager
+            .select_by_session_affinity(None, "conv-x", &busy)
+            .is_none());
+    }
+
+    #[test]
+    fn session_affinity_skips_disabled() {
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        // 找到 conv-aaa 当前选中的 id，把它禁用，应换到另一个
+        let original = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        manager.set_disabled(original, true).unwrap();
+        let after = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        assert_ne!(after, original, "禁用后应跳到其它可用凭据");
+    }
+
+    #[test]
+    fn session_affinity_new_sessions_rotate_via_lru() {
+        // v3：新会话按"最久未调用优先"分配，3 个 key 应铺到全部 3 个凭据
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        let mut ids = std::collections::HashSet::new();
+        for i in 0..3 {
+            let key = format!("sess-{}", i);
+            ids.insert(
+                manager
+                    .select_by_session_affinity(None, &key, &std::collections::HashSet::new())
+                    .unwrap()
+                    .0,
+            );
+        }
+        assert_eq!(ids.len(), 3, "LRU 应让 3 个新会话铺满 3 个凭据，实际: {:?}", ids);
+    }
+
+    #[test]
+    fn session_affinity_promotes_alt_after_threshold() {
+        // v3：primary 持续不可用（busy），次选连续命中达 K 次后转正为 primary
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            creds.push(c);
+        }
+        let mut config = Config::default();
+        config.affinity_promote_threshold = 3;
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        // 建立映射，拿到 primary
+        let primary = manager
+            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new())
+            .unwrap()
+            .0;
+        let mut busy = std::collections::HashSet::new();
+        busy.insert(primary);
+
+        // primary busy 期间，连续命中次选；达 K=3 后次选转正
+        let mut alt = 0;
+        for _ in 0..3 {
+            alt = manager
+                .select_by_session_affinity(None, "conv-p", &busy)
+                .unwrap()
+                .0;
+            assert_ne!(alt, primary);
+        }
+        // 此后即使 primary 重新可用（busy 清空），也应继续用已转正的 alt
+        let after_promote = manager
+            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new())
+            .unwrap()
+            .0;
+        assert_eq!(after_promote, alt, "次选连续命中 K 次后应转正为 primary");
     }
 
     #[test]

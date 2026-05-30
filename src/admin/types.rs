@@ -216,6 +216,72 @@ pub struct SetRateLimitCooldownRequest {
     pub cooldown_secs: u64,
 }
 
+/// 调度策略聚合响应（供调度面板一次拉取全部参数）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulingResponse {
+    /// 负载均衡模式（"priority" / "balanced" / "affinity"）
+    pub mode: String,
+    /// 命中 429 后凭据自动停用的冷却时长（秒）
+    pub cooldown_secs: u64,
+    /// 会话亲和：次选连续命中多少次后转正
+    pub affinity_promote_threshold: u32,
+    /// 会话亲和映射 TTL（秒）
+    pub affinity_map_ttl_secs: u64,
+}
+
+/// 更新调度策略请求（各字段可选，仅更新提供的项）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSchedulingRequest {
+    pub mode: Option<String>,
+    pub cooldown_secs: Option<u64>,
+    pub affinity_promote_threshold: Option<u32>,
+    pub affinity_map_ttl_secs: Option<u64>,
+}
+
+// ============ 反代 API Key 配置（多 key） ============
+
+/// 单个反代访问密钥（脱敏，不回传完整密钥）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyItem {
+    /// 行 ID（删除时用）
+    pub id: i64,
+    /// 脱敏后的密钥展示（如 `sk-4***b!`）
+    pub masked: String,
+    /// 备注标签
+    pub label: Option<String>,
+    /// 创建时间（Unix 毫秒）
+    pub created_at: i64,
+    /// 是否禁用（true = 已停用，认证时不匹配）
+    pub disabled: bool,
+}
+
+/// 设置 API Key 禁用状态请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetApiKeyDisabledRequest {
+    pub disabled: bool,
+}
+
+/// 反代访问密钥列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeysResponse {
+    pub keys: Vec<ApiKeyItem>,
+}
+
+/// 新增反代访问密钥请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddApiKeyRequest {
+    /// 新的反代访问密钥
+    pub key: String,
+    /// 备注标签（可选）
+    pub label: Option<String>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应
