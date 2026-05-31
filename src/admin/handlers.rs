@@ -9,9 +9,10 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddApiKeyRequest, AddCredentialRequest, ApiKeyItem, ApiKeysResponse, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetRateLimitCooldownRequest,
-        SuccessResponse, UpdateSchedulingRequest,
+        AddApiKeyRequest, AddCredentialRequest, ApiKeyItem, ApiKeysResponse, GroupItem,
+        GroupNameRequest, GroupsResponse, SetApiKeyGroupRequest, SetCredentialGroupRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SetRateLimitCooldownRequest, SuccessResponse, UpdateSchedulingRequest,
     },
 };
 
@@ -220,6 +221,7 @@ pub async fn list_api_keys(State(state): State<AdminState>) -> impl IntoResponse
                     label: r.label,
                     created_at: r.created_at,
                     disabled: r.disabled,
+                    group_id: r.group_id,
                 })
                 .collect();
             Json(ApiKeysResponse { keys }).into_response()
@@ -393,9 +395,229 @@ pub async fn set_api_key_disabled(
 }
 
 // ============================================================================
-// 请求日志查询
+// 账号池分组
 // ============================================================================
 
+/// GET /api/admin/groups —— 列出全部分组（含成员凭据 id）
+pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<GroupItem>> {
+        let groups = crate::db::groups::list(&path)?;
+        let map = crate::db::groups::credential_group_map(&path)?;
+        Ok(groups
+            .into_iter()
+            .map(|g| {
+                let credential_ids = map
+                    .iter()
+                    .filter(|(_, gid)| **gid == g.id)
+                    .map(|(cid, _)| *cid as u64)
+                    .collect::<Vec<_>>();
+                GroupItem {
+                    id: g.id,
+                    name: g.name,
+                    created_at: g.created_at,
+                    credential_ids,
+                }
+            })
+            .collect())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(groups)) => Json(GroupsResponse { groups }).into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/admin/groups —— 新建分组
+pub async fn add_group(
+    State(state): State<AdminState>,
+    Json(payload): Json<GroupNameRequest>,
+) -> impl IntoResponse {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "分组名不能为空" })),
+        )
+            .into_response();
+    }
+    let path = state.keys_db_path.clone();
+    let op = tokio::task::spawn_blocking(move || crate::db::groups::add(&path, &name)).await;
+    match op {
+        Ok(Ok(_id)) => Json(SuccessResponse::new("分组已创建")).into_response(),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") || msg.contains("constraint") {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "同名分组已存在" })),
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/admin/groups/{id} —— 重命名分组
+pub async fn rename_group(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<GroupNameRequest>,
+) -> impl IntoResponse {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "分组名不能为空" })),
+        )
+            .into_response();
+    }
+    let path = state.keys_db_path.clone();
+    let op = tokio::task::spawn_blocking(move || crate::db::groups::rename(&path, id, &name)).await;
+    match op {
+        Ok(Ok(0)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("分组 #{} 不存在", id) })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => Json(SuccessResponse::new("分组已重命名")).into_response(),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let code = if msg.contains("UNIQUE") || msg.contains("constraint") {
+                axum::http::StatusCode::CONFLICT
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/groups/{id} —— 删除分组（级联清空归属、解绑 apikey）
+pub async fn delete_group(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let op = tokio::task::spawn_blocking(move || crate::db::groups::delete(&path, id)).await;
+    let resp = match op {
+        Ok(Ok(0)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("分组 #{} 不存在", id) })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => Json(SuccessResponse::new("分组已删除")).into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    };
+    // 删组可能解绑了 apikey，但内存 key 列表（仅含明文）不受 group 影响，无需 reload
+    resp
+}
+
+/// PUT /api/admin/credentials/{id}/group —— 设置某凭据的分组归属
+pub async fn set_credential_group(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<SetCredentialGroupRequest>,
+) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let group_id = payload.group_id;
+    let op = tokio::task::spawn_blocking(move || {
+        crate::db::groups::set_credential_group(&path, id as i64, group_id)
+    })
+    .await;
+    match op {
+        Ok(Ok(())) => Json(SuccessResponse::new("凭据分组已更新")).into_response(),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            // group_id 不存在会触发外键错误
+            let code = if msg.contains("FOREIGN KEY") || msg.contains("constraint") {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/admin/api-keys/{id}/group —— 设置某 apikey 的分组绑定
+pub async fn set_api_key_group(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<SetApiKeyGroupRequest>,
+) -> impl IntoResponse {
+    let path = state.keys_db_path.clone();
+    let group_id = payload.group_id;
+    let op =
+        tokio::task::spawn_blocking(move || crate::db::groups::set_key_group(&path, id, group_id))
+            .await;
+    match op {
+        Ok(Ok(0)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("API Key #{} 不存在", id) })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => Json(SuccessResponse::new("API Key 分组绑定已更新")).into_response(),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let code = if msg.contains("FOREIGN KEY") || msg.contains("constraint") {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("task panic: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// 请求日志查询
+// ============================================================================
 use axum::extract::Query;
 use serde::Deserialize;
 

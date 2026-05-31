@@ -18,6 +18,8 @@ pub struct ApiKeyRow {
     pub created_at: i64,
     /// 是否禁用（true 则中间件认证时不再匹配此 key）
     pub disabled: bool,
+    /// 绑定的分组 id（None = 未绑定分组，可用全部账号）
+    pub group_id: Option<i64>,
 }
 
 /// 打开读写连接并确保 schema 存在（写入极少，按需开短连接）
@@ -32,7 +34,7 @@ fn open_rw<P: AsRef<Path>>(path: P) -> SqlResult<Connection> {
 pub fn list<P: AsRef<Path>>(path: P) -> SqlResult<Vec<ApiKeyRow>> {
     let conn = open_rw(path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, key, label, created_at, COALESCE(disabled, 0) FROM api_keys ORDER BY id ASC",
+        "SELECT id, key, label, created_at, COALESCE(disabled, 0), group_id FROM api_keys ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(ApiKeyRow {
@@ -41,6 +43,7 @@ pub fn list<P: AsRef<Path>>(path: P) -> SqlResult<Vec<ApiKeyRow>> {
             label: r.get(2)?,
             created_at: r.get(3)?,
             disabled: r.get::<_, i64>(4)? != 0,
+            group_id: r.get(5)?,
         })
     })?;
     let mut out = Vec::new();

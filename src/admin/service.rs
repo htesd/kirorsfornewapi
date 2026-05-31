@@ -318,6 +318,7 @@ impl AdminService {
             cooldown_secs: self.token_manager.get_rate_limit_cooldown_secs(),
             affinity_promote_threshold: self.token_manager.get_affinity_promote_threshold(),
             affinity_map_ttl_secs: self.token_manager.get_affinity_map_ttl_secs(),
+            perceived_cache_hit_ratio: self.token_manager.get_perceived_cache_hit_ratio(),
         }
     }
 
@@ -349,6 +350,21 @@ impl AdminService {
         if let Some(ttl) = req.affinity_map_ttl_secs {
             self.token_manager
                 .set_affinity_map_ttl_secs(ttl)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        // 感知缓存放大：disable=true 优先（显式关闭）；否则若给了 ratio 就设置
+        if req.disable_perceived_cache == Some(true) {
+            self.token_manager
+                .set_perceived_cache_hit_ratio(None)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        } else if let Some(r) = req.perceived_cache_hit_ratio {
+            if !(0.0..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "perceivedCacheHitRatio 必须在 [0, 1] 区间".to_string(),
+                ));
+            }
+            self.token_manager
+                .set_perceived_cache_hit_ratio(Some(r))
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
         Ok(self.get_scheduling())

@@ -186,7 +186,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         log_recorder,
-        config.perceived_cache_hit_ratio,
+        Some(keys_db_path.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

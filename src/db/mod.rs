@@ -2,6 +2,7 @@
 
 pub mod api_keys;
 mod config;
+pub mod groups;
 pub mod query;
 mod recorder;
 mod schema;

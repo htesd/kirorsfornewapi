@@ -40,14 +40,14 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     log_recorder: Option<LogRecorder>,
-    perceived_cache_hit_ratio: Option<f64>,
+    keys_db_path: Option<std::path::PathBuf>,
 ) -> Router {
     let mut state = AppState::new(api_keys, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
     state = state.with_log_recorder(log_recorder);
-    state = state.with_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
+    state = state.with_keys_db_path(keys_db_path);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

@@ -554,6 +554,14 @@ pub struct StreamContext {
     /// 流结束时实际 emit 给 NewAPI 的 cache_read（generate_final_events 设置）
     pub emitted_cache_read: Option<i32>,
     pub emitted_cache_creation: Option<i32>,
+    /// 原生 reasoningContentEvent 的 thinking 块是否已开启（未关闭）
+    /// 与 fake `<thinking>` 标签解析互斥：上游走独立 reasoning 流时用这条路径。
+    reasoning_block_active: bool,
+    /// 是否签名了原生 reasoning 块（用于 thinking 块的 signature_delta 收尾）
+    reasoning_signature_sent: bool,
+    /// 本次响应是否出现过原生 reasoning。一旦出现，正文走纯 text（绕过 fake
+    /// `<thinking>` 标签解析）——因为推理已在独立通道，正文不会再含 `<thinking>`。
+    native_reasoning_seen: bool,
 }
 
 impl StreamContext {
@@ -586,6 +594,9 @@ impl StreamContext {
             perceived_cache_hit_ratio: None,
             emitted_cache_read: None,
             emitted_cache_creation: None,
+            reasoning_block_active: false,
+            reasoning_signature_sent: false,
+            native_reasoning_seen: false,
         }
     }
 
@@ -657,6 +668,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(r) => self.process_reasoning_content(&r.text),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -729,14 +741,92 @@ impl StreamContext {
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
-        // 如果启用了thinking，需要处理thinking块
-        if self.thinking_enabled {
-            return self.process_content_with_thinking(content);
+        // 若正文开始前有开着的原生 reasoning thinking 块，先关闭它
+        // （Anthropic 要求 thinking 块在 text 块之前并独立闭合）
+        let mut events = self.close_reasoning_block_if_open();
+
+        // 如果启用了thinking，需要处理thinking块（fake `<thinking>` 标签解析路径）。
+        // 但若本次已出现原生 reasoning，则正文走纯 text，不再做 fake 标签解析
+        // （推理已在独立通道，正文不含 `<thinking>`）。
+        if self.thinking_enabled && !self.native_reasoning_seen {
+            events.extend(self.process_content_with_thinking(content));
+            return events;
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        self.create_text_delta_events(content)
+        events.extend(self.create_text_delta_events(content));
+        events
+    }
+
+    /// 处理原生 reasoningContentEvent —— 转成 Anthropic thinking 块。
+    ///
+    /// 与 `process_content_with_thinking`（从正文文本里抠 `<thinking>` 标签的 fake 路径）
+    /// 不同：这里上游已经把推理放在独立事件流，我们直接逐片发 thinking_delta，
+    /// 不需要标签解析。thinking 块必须在 text 块之前，所以首个 reasoning 片段
+    /// 会分配最小的块索引。
+    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        self.output_tokens += estimate_tokens(text);
+        self.native_reasoning_seen = true;
+
+        let mut events = Vec::new();
+
+        // 首个 reasoning 片段：开 thinking 块
+        if !self.reasoning_block_active {
+            let idx = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(idx);
+            self.reasoning_block_active = true;
+            let start_events = self.state_manager.handle_content_block_start(
+                idx,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            );
+            events.extend(start_events);
+        }
+
+        if let Some(idx) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(idx, text));
+        }
+
+        events
+    }
+
+    /// 关闭开着的原生 reasoning thinking 块（若有）。
+    ///
+    /// Anthropic 规范：thinking 块结束前需发一个 `signature_delta`（哪怕签名为空字符串），
+    /// 再发 `content_block_stop`。返回需要发送的 SSE 事件。
+    fn close_reasoning_block_if_open(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.reasoning_block_active {
+            return events;
+        }
+        if let Some(idx) = self.thinking_block_index {
+            // signature_delta（占位空签名，满足客户端对 thinking 块结构的期望）
+            if !self.reasoning_signature_sent {
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": { "type": "signature_delta", "signature": "" }
+                    }),
+                ));
+                self.reasoning_signature_sent = true;
+            }
+            if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop);
+            }
+        }
+        self.reasoning_block_active = false;
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -967,6 +1057,9 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // 若 reasoning 后直接进入 tool_use，先关闭原生 reasoning thinking 块
+        events.extend(self.close_reasoning_block_if_open());
+
         self.state_manager.set_has_tool_use(true);
 
         // tool_use 必须发生在 thinking 结束之后。
@@ -1087,6 +1180,9 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 若流结束时原生 reasoning thinking 块仍开着（纯思考无后续正文），先干净关闭
+        events.extend(self.close_reasoning_block_if_open());
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -2061,5 +2157,68 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    // ===== 原生 reasoningContentEvent → thinking 块 =====
+
+    fn reasoning_event(text: &str) -> Event {
+        let json = json!({ "text": text });
+        Event::ReasoningContent(
+            serde_json::from_value(json).expect("build ReasoningContentEvent"),
+        )
+    }
+
+    #[test]
+    fn native_reasoning_emits_thinking_block() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&reasoning_event("Let me ")));
+        events.extend(ctx.process_kiro_event(&reasoning_event("think.")));
+
+        // 应有一个 thinking 类型的 content_block_start
+        let start = events.iter().find(|e| {
+            e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "thinking"
+        });
+        assert!(start.is_some(), "应发出 thinking content_block_start");
+
+        // 应有 thinking_delta，且内容为推理文本
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(deltas, vec!["Let me ", "think."]);
+    }
+
+    #[test]
+    fn native_reasoning_closes_before_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&reasoning_event("thinking...")));
+        // 正文到来：应先关闭 thinking 块（含 signature_delta + content_block_stop），再开 text 块
+        events.extend(ctx.process_assistant_response("answer"));
+
+        let sig = events.iter().position(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        });
+        let stop = events
+            .iter()
+            .position(|e| e.event == "content_block_stop");
+        let text_start = events.iter().position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        });
+
+        assert!(sig.is_some(), "应发 signature_delta 收尾 thinking 块");
+        assert!(stop.is_some(), "应发 content_block_stop 关闭 thinking 块");
+        assert!(text_start.is_some(), "应为正文开 text 块");
+        // 顺序：signature_delta < content_block_stop < text content_block_start
+        assert!(sig.unwrap() < stop.unwrap());
+        assert!(stop.unwrap() < text_start.unwrap());
     }
 }

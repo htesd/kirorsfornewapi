@@ -10,7 +10,7 @@ use crate::token;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::logging;
-use super::middleware::AppState;
+use super::middleware::{AllowedCredentials, AppState};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
@@ -253,6 +253,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(AllowedCredentials(allowed_group)): Extension<AllowedCredentials>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -405,6 +406,9 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
+    // 感知缓存放大比例：读 provider 的 live 值（运行时可热调），而非 AppState 启动快照
+    let perceived_ratio = provider.perceived_cache_hit_ratio();
+
     if payload.stream {
         handle_stream_request(
             provider,
@@ -415,7 +419,8 @@ pub async fn post_messages(
             tool_name_map,
             builder,
             recorder,
-            state.perceived_cache_hit_ratio,
+            perceived_ratio,
+            allowed_group,
         )
         .await
     } else {
@@ -429,7 +434,8 @@ pub async fn post_messages(
             tool_name_map,
             builder,
             recorder,
-            state.perceived_cache_hit_ratio,
+            perceived_ratio,
+            allowed_group,
         )
         .await
     }
@@ -446,9 +452,13 @@ async fn handle_stream_request(
     mut builder: RequestRecordBuilder,
     recorder: Option<LogRecorder>,
     perceived_cache_hit_ratio: Option<f64>,
+    allowed_group: Option<std::collections::HashSet<u64>>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let outcome = match provider.call_api_stream(request_body).await {
+    // 调用 Kiro API（支持多凭据故障转移 + 分组隔离）
+    let outcome = match provider
+        .call_api_stream_in_group(request_body, allowed_group)
+        .await
+    {
         Ok(out) => out,
         Err(e) => return record_and_map_error(e, builder, recorder.as_ref()),
     };
@@ -633,9 +643,10 @@ async fn handle_non_stream_request(
     mut builder: RequestRecordBuilder,
     recorder: Option<LogRecorder>,
     perceived_cache_hit_ratio: Option<f64>,
+    allowed_group: Option<std::collections::HashSet<u64>>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let outcome = match provider.call_api(request_body).await {
+    // 调用 Kiro API（支持多凭据故障转移 + 分组隔离）
+    let outcome = match provider.call_api_in_group(request_body, allowed_group).await {
         Ok(out) => out,
         Err(e) => return record_and_map_error(e, builder, recorder.as_ref()),
     };
@@ -670,6 +681,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // 原生 reasoningContentEvent 累积的推理内容（与正文 text 分开）
+    let mut reasoning_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -692,6 +705,10 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(r) => {
+                            // 原生推理流，累积为独立 thinking 块（不混入正文）
+                            reasoning_content.push_str(&r.text);
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -789,8 +806,22 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
+    // 原生 reasoningContentEvent 优先：直接作为 thinking 块放在最前
+    if !reasoning_content.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning_content,
+            "signature": ""
+        }));
+        // 正文按普通 text 输出（原生 reasoning 已独立，不再做 <thinking> 标签提取）
+        if !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
+    } else if thinking_enabled {
+        // 回退：fake 路径——从完整文本中提取 <thinking> 块
         let (thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
 
@@ -862,40 +893,58 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 覆写 thinking 配置：让 Opus 默认开启思维链，并按模型名后缀处理其他情况。
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 规则（优先级从上到下）：
+/// - **Opus 全系（4.6/4.7/4.8 及后续）**：默认 adaptive + effort，**无需 `-thinking` 后缀**。
+///   effort 优先用客户端传入的 `output_config.effort`，缺省 "high"。
+///   （若客户端已显式传了 thinking 配置，尊重客户端，不覆写。）
+/// - **非 Opus 但模型名含 `-thinking` 后缀**（sonnet/haiku 等）：enabled + 固定 budget。
+/// - **其余**：不动。
+///
+/// 历史：旧实现要求模型名必须含 "thinking" 才处理，且 adaptive 硬编码为"仅 opus-4.6"，
+/// 导致 4.7/4.8 即便带后缀也退化成 enabled、effort 传不进去；不带后缀则完全无思维链。
+/// 现按"Opus 系列默认 adaptive"，避免逐版本硬编码过时，也省去客户端配后缀。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
-        return;
-    }
+    let is_opus = model_lower.contains("opus");
+    let has_thinking_suffix = model_lower.contains("thinking");
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    if is_opus {
+        // 客户端已显式配置 thinking 则尊重之，不覆写（含 budget/类型）
+        if payload.thinking.is_some() {
+            return;
+        }
+        // effort 客户端传入优先，缺省 high
+        let effort = payload
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.clone())
+            .unwrap_or_else(|| "high".to_string());
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+        tracing::info!(
+            model = %payload.model,
+            thinking_type = "adaptive",
+            effort = %effort,
+            "Opus 模型默认开启 adaptive 思维链"
+        );
 
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
+        payload.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        payload.output_config = Some(OutputConfig { effort });
+    } else if has_thinking_suffix {
+        // 非 Opus 但带 -thinking 后缀：enabled + 固定 budget
+        tracing::info!(
+            model = %payload.model,
+            thinking_type = "enabled",
+            "非 Opus 模型名含 thinking 后缀，覆写为 enabled"
+        );
 
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-    });
-    
-    if is_opus_4_6 {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 20000,
         });
     }
 }
@@ -931,6 +980,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(AllowedCredentials(allowed_group)): Extension<AllowedCredentials>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1019,6 +1069,9 @@ pub async fn post_messages_cc(
     let thinking_enabled = payload.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
     let tool_name_map = conversion_result.tool_name_map;
 
+    // 感知缓存放大比例：读 provider 的 live 值（运行时可热调）
+    let perceived_ratio = provider.perceived_cache_hit_ratio();
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -1028,13 +1081,14 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
-            state.perceived_cache_hit_ratio,
+            perceived_ratio,
+            allowed_group,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder, state.perceived_cache_hit_ratio).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder, perceived_ratio, allowed_group).await
     }
 }
 
@@ -1050,9 +1104,13 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     perceived_cache_hit_ratio: Option<f64>,
+    allowed_group: Option<std::collections::HashSet<u64>>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let outcome = match provider.call_api_stream(request_body).await {
+    // 调用 Kiro API（支持多凭据故障转移 + 分组隔离）
+    let outcome = match provider
+        .call_api_stream_in_group(request_body, allowed_group)
+        .await
+    {
         Ok(out) => out,
         Err(e) => return map_provider_error(e),
     };
@@ -1169,4 +1227,80 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod thinking_override_tests {
+    use super::*;
+
+    fn req(model: &str, extra: serde_json::Value) -> MessagesRequest {
+        let mut base = serde_json::json!({
+            "model": model,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        // 合并额外字段（thinking / output_config 等）
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(base).expect("construct MessagesRequest")
+    }
+
+    #[test]
+    fn opus_4_8_defaults_to_adaptive_without_suffix() {
+        // 核心修复：opus-4.8 即使不带 -thinking 后缀也默认 adaptive + high
+        let mut p = req("claude-opus-4-8", serde_json::json!({}));
+        override_thinking_from_model_name(&mut p);
+        let t = p.thinking.expect("opus 应默认开 thinking");
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(p.output_config.map(|c| c.effort).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn opus_4_7_also_adaptive() {
+        let mut p = req("claude-opus-4-7", serde_json::json!({}));
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.unwrap().thinking_type, "adaptive");
+    }
+
+    #[test]
+    fn opus_respects_client_effort() {
+        // 客户端传入的 effort 优先，不被覆盖为 high
+        let mut p = req(
+            "claude-opus-4-8",
+            serde_json::json!({ "output_config": { "effort": "low" } }),
+        );
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.output_config.map(|c| c.effort).as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn opus_respects_explicit_client_thinking() {
+        // 客户端已显式配置 thinking 则尊重之，不覆写
+        let mut p = req(
+            "claude-opus-4-8",
+            serde_json::json!({ "thinking": { "type": "enabled", "budget_tokens": 5000 } }),
+        );
+        override_thinking_from_model_name(&mut p);
+        let t = p.thinking.unwrap();
+        assert_eq!(t.thinking_type, "enabled");
+        assert_eq!(t.budget_tokens, 5000);
+    }
+
+    #[test]
+    fn non_opus_without_suffix_stays_off() {
+        // sonnet 不带后缀 → 不开 thinking（保持历史行为）
+        let mut p = req("claude-sonnet-4-6", serde_json::json!({}));
+        override_thinking_from_model_name(&mut p);
+        assert!(p.thinking.is_none());
+    }
+
+    #[test]
+    fn non_opus_with_suffix_uses_enabled() {
+        let mut p = req("claude-sonnet-4-6-thinking", serde_json::json!({}));
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.unwrap().thinking_type, "enabled");
+    }
 }

@@ -26,6 +26,9 @@ export function SchedulingPanel() {
   const [k, setK] = useState('3')
   const [cooldown, setCooldown] = useState('300')
   const [ttl, setTtl] = useState('1800')
+  // 感知缓存放大：开关 + 比例（百分数输入，0-100）
+  const [cacheOn, setCacheOn] = useState(false)
+  const [cachePct, setCachePct] = useState('95')
 
   useEffect(() => {
     if (!data) return
@@ -33,6 +36,9 @@ export function SchedulingPanel() {
     setK(String(data.affinityPromoteThreshold))
     setCooldown(String(data.cooldownSecs))
     setTtl(String(data.affinityMapTtlSecs))
+    const ratio = data.perceivedCacheHitRatio
+    setCacheOn(ratio !== null)
+    if (ratio !== null) setCachePct(String(Math.round(ratio * 100)))
   }, [data])
 
   const commit = (patch: UpdateSchedulingPayload, label: string) => {
@@ -60,6 +66,31 @@ export function SchedulingPanel() {
     }
     if (n === current) return
     commit({ [field]: Math.floor(n) } as UpdateSchedulingPayload, label)
+  }
+
+  // 切换感知缓存放大开关
+  const commitCacheToggle = (on: boolean) => {
+    setCacheOn(on)
+    if (on) {
+      const pct = Number(cachePct)
+      const ratio = Number.isFinite(pct) ? Math.min(Math.max(pct, 0), 100) / 100 : 0.95
+      commit({ perceivedCacheHitRatio: ratio }, '缓存放大比例')
+    } else {
+      commit({ disablePerceivedCache: true }, '缓存放大')
+    }
+  }
+
+  // 提交感知缓存放大比例（百分数 0-100 → 0-1）
+  const commitCachePct = () => {
+    if (!cacheOn) return
+    const pct = Number(cachePct)
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+      toast.error('放大比例需在 0–100 之间')
+      return
+    }
+    const ratio = pct / 100
+    if (data?.perceivedCacheHitRatio !== null && ratio === data?.perceivedCacheHitRatio) return
+    commit({ perceivedCacheHitRatio: ratio }, '缓存放大比例')
   }
 
   const isAffinity = mode === 'affinity'
@@ -138,6 +169,33 @@ export function SchedulingPanel() {
               onBlur={() => commitNumber(cooldown, 'cooldownSecs', data?.cooldownSecs, '限流冷却')}
             />
             <p className="text-[11px] text-muted-foreground">账号命中 429 后被跳过的冷却时长，到点自动恢复</p>
+          </div>
+
+          {/* 感知缓存放大（全局，作用于上报给中转网关的 usage） */}
+          <div className="space-y-1 border-t pt-3">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={cacheOn}
+                disabled={isPending}
+                onChange={(e) => commitCacheToggle(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              感知缓存命中放大
+            </label>
+            <Input
+              type="number"
+              min={0}
+              max={100}
+              value={cachePct}
+              disabled={!cacheOn || isPending}
+              onChange={(e) => setCachePct(e.target.value)}
+              onBlur={commitCachePct}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              命中时把上报给中转网关的 cache_read 比例直接覆盖为此百分比（0–100）。
+              代理方承担与 Kiro 真实计费的差额。关闭则按真实/估算值上报。
+            </p>
           </div>
         </div>
       )}

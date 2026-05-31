@@ -18,6 +18,8 @@ pub enum EventType {
     ContextUsage,
     /// Token 用量事件（含 cacheRead/cacheWrite/output 精确明细）
     TokenUsage,
+    /// 推理内容事件（thinking 开启时上游下发的独立推理流）
+    ReasoningContent,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +33,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "tokenUsageEvent" => Self::TokenUsage,
+            "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +46,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::TokenUsage => "tokenUsageEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,6 +81,8 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// Token 用量明细（cacheRead/cacheWrite/output 等）
     TokenUsage(super::TokenUsageEvent),
+    /// 推理内容（thinking 开启时上游的独立推理流）
+    ReasoningContent(super::ReasoningContentEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -138,6 +144,10 @@ impl Event {
             EventType::TokenUsage => {
                 let payload = super::TokenUsageEvent::from_frame(&frame)?;
                 Ok(Self::TokenUsage(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::Unknown => {
                 // 一次性记录未知事件类型 + payload 摘要，便于发现 Kiro 后续新增的事件

@@ -19,6 +19,12 @@ import {
   addApiKey,
   deleteApiKey,
   setApiKeyDisabled,
+  listGroups,
+  addGroup,
+  renameGroup,
+  deleteGroup,
+  setCredentialGroup,
+  setApiKeyGroup,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -216,6 +222,74 @@ export function useSetConcurrency() {
       setCredentialConcurrency(id, maxConcurrency),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// ============ 账号池分组 ============
+
+// 列出全部分组（含成员凭据 id）
+export function useGroups() {
+  return useQuery({
+    queryKey: ['groups'],
+    queryFn: listGroups,
+  })
+}
+
+// 新建分组
+export function useAddGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (name: string) => addGroup(name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+    },
+  })
+}
+
+// 重命名分组
+export function useRenameGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) => renameGroup(id, name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+    },
+  })
+}
+
+// 删除分组（级联清空归属、解绑 apikey）
+export function useDeleteGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteGroup(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// 设置某凭据的分组归属
+export function useSetCredentialGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, groupId }: { id: number; groupId: number | null }) =>
+      setCredentialGroup(id, groupId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+    },
+  })
+}
+
+// 设置某 apikey 的分组绑定
+export function useSetApiKeyGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, groupId }: { id: number; groupId: number | null }) =>
+      setApiKeyGroup(id, groupId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
     },
   })
 }

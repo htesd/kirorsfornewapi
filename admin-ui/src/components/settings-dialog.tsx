@@ -15,9 +15,12 @@ import {
   useAddApiKey,
   useDeleteApiKey,
   useSetApiKeyDisabled,
+  useGroups,
+  useSetApiKeyGroup,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { SchedulingPanel } from '@/components/scheduling-panel'
+import { GroupsPanel } from '@/components/groups-panel'
 
 interface SettingsDialogProps {
   open: boolean
@@ -29,11 +32,24 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const { mutate: addKey, isPending: isAdding } = useAddApiKey()
   const { mutate: deleteKey } = useDeleteApiKey()
   const { mutate: toggleDisabled } = useSetApiKeyDisabled()
+  const { data: groupsData } = useGroups()
+  const { mutate: setKeyGroup } = useSetApiKeyGroup()
   const [newKey, setNewKey] = useState('')
   const [newLabel, setNewLabel] = useState('')
 
   const keys = data?.keys ?? []
+  const groups = groupsData?.groups ?? []
   const enabledCount = keys.filter((k) => !k.disabled).length
+
+  const handleSetKeyGroup = (id: number, groupId: number | null) => {
+    setKeyGroup(
+      { id, groupId },
+      {
+        onSuccess: () => toast.success('分组绑定已更新'),
+        onError: (error) => toast.error(`更新失败: ${extractErrorMessage(error)}`),
+      },
+    )
+  }
 
   const handleAdd = () => {
     const trimmed = newKey.trim()
@@ -118,6 +134,21 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         {k.label ? `${k.label} · ` : ''}
                         {formatDate(k.createdAt)}
                       </div>
+                      <select
+                        value={k.groupId ?? ''}
+                        onChange={(e) =>
+                          handleSetKeyGroup(k.id, e.target.value === '' ? null : Number(e.target.value))
+                        }
+                        className="mt-1 h-7 w-full rounded border border-input bg-transparent px-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        title="该 Key 可用的账号分组（严格隔离）"
+                      >
+                        <option value="">未分组（全部账号）</option>
+                        {groups.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            分组：{g.name}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       <Button
@@ -175,6 +206,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               {isAdding ? '添加中...' : '添加'}
             </Button>
           </div>
+
+          {/* 账号池分组 */}
+          <GroupsPanel />
 
           {/* 调度策略 */}
           <SchedulingPanel />

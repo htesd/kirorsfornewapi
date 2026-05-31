@@ -228,6 +228,8 @@ pub struct SchedulingResponse {
     pub affinity_promote_threshold: u32,
     /// 会话亲和映射 TTL（秒）
     pub affinity_map_ttl_secs: u64,
+    /// 感知缓存命中放大比例（0-1；null = 未启用放大，按真实值上报）
+    pub perceived_cache_hit_ratio: Option<f64>,
 }
 
 /// 更新调度策略请求（各字段可选，仅更新提供的项）
@@ -238,6 +240,10 @@ pub struct UpdateSchedulingRequest {
     pub cooldown_secs: Option<u64>,
     pub affinity_promote_threshold: Option<u32>,
     pub affinity_map_ttl_secs: Option<u64>,
+    /// 设置感知缓存放大比例（0-1，会被 clamp）。缺省=不改；与 disable_perceived_cache 互斥
+    pub perceived_cache_hit_ratio: Option<f64>,
+    /// 显式关闭感知缓存放大（true=设为 None，按真实值上报）。缺省=不改
+    pub disable_perceived_cache: Option<bool>,
 }
 
 // ============ 反代 API Key 配置（多 key） ============
@@ -256,6 +262,8 @@ pub struct ApiKeyItem {
     pub created_at: i64,
     /// 是否禁用（true = 已停用，认证时不匹配）
     pub disabled: bool,
+    /// 绑定的分组 id（None = 未绑定，可用全部账号）
+    pub group_id: Option<i64>,
 }
 
 /// 设置 API Key 禁用状态请求
@@ -263,6 +271,13 @@ pub struct ApiKeyItem {
 #[serde(rename_all = "camelCase")]
 pub struct SetApiKeyDisabledRequest {
     pub disabled: bool,
+}
+
+/// 设置 API Key 分组绑定请求（groupId=null 表示解绑）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetApiKeyGroupRequest {
+    pub group_id: Option<i64>,
 }
 
 /// 反代访问密钥列表响应
@@ -280,6 +295,40 @@ pub struct AddApiKeyRequest {
     pub key: String,
     /// 备注标签（可选）
     pub label: Option<String>,
+}
+
+// ============ 账号池分组 ============
+
+/// 单个分组（含成员凭据 id 列表）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupItem {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    /// 该分组下的凭据 id 列表
+    pub credential_ids: Vec<u64>,
+}
+
+/// 分组列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsResponse {
+    pub groups: Vec<GroupItem>,
+}
+
+/// 新增 / 重命名分组请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupNameRequest {
+    pub name: String,
+}
+
+/// 设置某凭据的分组归属请求（groupId=null 表示移出分组）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialGroupRequest {
+    pub group_id: Option<i64>,
 }
 
 // ============ 通用响应 ============

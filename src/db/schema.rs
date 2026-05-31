@@ -142,6 +142,23 @@ pub fn init(conn: &Connection) -> SqlResult<()> {
             label       TEXT,
             created_at  INTEGER NOT NULL
         );
+
+        -- 账号池分组：每个分组是一组凭据的逻辑集合，apikey 可绑定到某分组。
+        -- 分组本身与 credentials.json 解耦，是纯运营层（参见 credential_groups 映射）。
+        CREATE TABLE IF NOT EXISTS groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            created_at  INTEGER NOT NULL
+        );
+
+        -- 凭据 → 分组 的多对一映射（credential_id 为 token_manager 分配的稳定 id）。
+        -- 一个凭据只属于一个分组；未在此表中的凭据视为"未分组"。
+        CREATE TABLE IF NOT EXISTS credential_groups (
+            credential_id  INTEGER PRIMARY KEY,
+            group_id       INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            assigned_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_credgroups_group ON credential_groups(group_id);
         "#,
     )?;
 
@@ -171,6 +188,17 @@ pub fn init(conn: &Connection) -> SqlResult<()> {
             "ALTER TABLE api_keys ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+
+    // v35 迁移：api_keys.group_id 列。NULL = 未绑定分组（沿用历史行为，可用全部账号）；
+    // 非 NULL = 严格隔离到该分组（仅用该分组内的账号）。
+    let has_group_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'group_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_group_id == 0 {
+        conn.execute("ALTER TABLE api_keys ADD COLUMN group_id INTEGER", [])?;
     }
 
     Ok(())

@@ -145,6 +145,14 @@ impl KiroProvider {
         }
     }
 
+    /// 当前生效的感知缓存命中放大比例（运行时可调，读 token_manager 的 live 值）
+    ///
+    /// handler 在每次请求时调用此方法，而非使用启动时的 AppState 快照，
+    /// 这样 Admin 面板热调后立即对后续请求生效。
+    pub fn perceived_cache_hit_ratio(&self) -> Option<f64> {
+        self.token_manager.get_perceived_cache_hit_ratio()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -177,12 +185,33 @@ impl KiroProvider {
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// 返回值包含 `account_id` / `attempts` 等元信息，供日志层使用。
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<CallOutcome> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false, None).await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<CallOutcome> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(request_body, true, None).await
+    }
+
+    /// 发送 API 请求（带分组隔离）。`allowed_group` 见
+    /// [`MultiTokenManager::acquire_context_with_session_and_group`]。
+    pub async fn call_api_in_group(
+        &self,
+        request_body: &str,
+        allowed_group: Option<std::collections::HashSet<u64>>,
+    ) -> anyhow::Result<CallOutcome> {
+        self.call_api_with_retry(request_body, false, allowed_group)
+            .await
+    }
+
+    /// 发送流式 API 请求（带分组隔离）。
+    pub async fn call_api_stream_in_group(
+        &self,
+        request_body: &str,
+        allowed_group: Option<std::collections::HashSet<u64>>,
+    ) -> anyhow::Result<CallOutcome> {
+        self.call_api_with_retry(request_body, true, allowed_group)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -345,6 +374,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        allowed_group: Option<std::collections::HashSet<u64>>,
     ) -> anyhow::Result<CallOutcome> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -361,7 +391,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context_with_session(model.as_deref(), session_key.as_deref())
+                .acquire_context_with_session_and_group(
+                    model.as_deref(),
+                    session_key.as_deref(),
+                    allowed_group.clone(),
+                )
                 .await
             {
                 Ok(c) => c,

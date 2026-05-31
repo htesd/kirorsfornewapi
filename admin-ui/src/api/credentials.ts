@@ -127,9 +127,20 @@ export interface Scheduling {
   cooldownSecs: number
   affinityPromoteThreshold: number
   affinityMapTtlSecs: number
+  /** 感知缓存命中放大比例（0-1；null = 未启用放大，按真实值上报） */
+  perceivedCacheHitRatio: number | null
 }
 
-export type UpdateSchedulingPayload = Partial<Scheduling>
+export type UpdateSchedulingPayload = Partial<{
+  mode: SchedulingMode
+  cooldownSecs: number
+  affinityPromoteThreshold: number
+  affinityMapTtlSecs: number
+  /** 设置放大比例（0-1）。与 disablePerceivedCache 互斥 */
+  perceivedCacheHitRatio: number
+  /** true = 关闭放大（设为 null） */
+  disablePerceivedCache: boolean
+}>
 
 // 获取调度策略全部参数
 export async function getScheduling(): Promise<Scheduling> {
@@ -150,6 +161,8 @@ export interface ApiKeyItem {
   label: string | null
   createdAt: number
   disabled: boolean
+  /** 绑定的分组 id（null = 未绑定，可用全部账号） */
+  groupId: number | null
 }
 
 // 列出全部反代访问密钥
@@ -202,5 +215,57 @@ export async function listRequests(params: {
 // 请求日志详情
 export async function getRequestDetail(id: string): Promise<RequestLogDetail> {
   const { data } = await api.get<RequestLogDetail>(`/requests/${encodeURIComponent(id)}`)
+  return data
+}
+
+// ============ 账号池分组 ============
+
+export interface GroupItem {
+  id: number
+  name: string
+  createdAt: number
+  /** 该分组下的凭据 id 列表 */
+  credentialIds: number[]
+}
+
+// 列出全部分组（含成员凭据 id）
+export async function listGroups(): Promise<{ groups: GroupItem[] }> {
+  const { data } = await api.get<{ groups: GroupItem[] }>('/groups')
+  return data
+}
+
+// 新建分组
+export async function addGroup(name: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/groups', { name })
+  return data
+}
+
+// 重命名分组
+export async function renameGroup(id: number, name: string): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/groups/${id}`, { name })
+  return data
+}
+
+// 删除分组（级联清空归属、解绑 apikey）
+export async function deleteGroup(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/groups/${id}`)
+  return data
+}
+
+// 设置某凭据的分组归属（groupId=null 移出分组）
+export async function setCredentialGroup(
+  id: number,
+  groupId: number | null,
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/credentials/${id}/group`, { groupId })
+  return data
+}
+
+// 设置某 apikey 的分组绑定（groupId=null 解绑）
+export async function setApiKeyGroup(
+  id: number,
+  groupId: number | null,
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/api-keys/${id}/group`, { groupId })
   return data
 }

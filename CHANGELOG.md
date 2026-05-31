@@ -1,5 +1,63 @@
 # Changelog
 
+## [v36] - 2026-06-01
+
+### Features —— 原生 thinking / reasoning 接入（reasoningContentEvent）
+
+- **接入 Kiro 上游原生推理流**：新增 `reasoningContentEvent` 事件解析（`src/kiro/model/events/reasoning_content.rs`），
+  转成 Anthropic 标准 thinking 块返回客户端。此前反代完全没解析这个事件类型，
+  上游下发的推理内容（payload `{"text":...}`）被当 `EventType::Unknown` **整段丢弃**
+  ——实测一次请求丢弃 453 个 reasoning 片段。
+  - `base.rs`：`EventType::ReasoningContent` + `Event::ReasoningContent` 分发。
+  - 流式（`stream.rs`）：`process_reasoning_content` 发 `content_block_start(type=thinking)`
+    → `thinking_delta` → `signature_delta` → `content_block_stop`。`native_reasoning_seen`
+    标志让正文绕过 fake `<thinking>` 标签解析。reasoning→text / reasoning→tool_use / 流末尾
+    三处都先 `close_reasoning_block_if_open`。
+  - 非流式（`handlers.rs`）：累积 reasoning 作为独立 thinking 块放最前；保留 fake 文本解析作 fallback。
+- **Opus 全系默认开启 adaptive 思维链**：`override_thinking_from_model_name` 改为"所有 opus
+  默认 adaptive + effort"（无需 `-thinking` 后缀），effort 客户端传入优先、缺省 high。
+  旧实现硬编码 `is_opus_4_6`，导致 4.7/4.8 退化成 enabled、effort 丢失。
+
+### Verified（实测）
+- v36 上线后 opus-4.8 流式请求正确产出 thinking 块（thinking + thinking_delta + signature_delta + text）；
+  reasoningContentEvent 未识别日志从 453 降到 0。
+- thinking 为**真实推理**（数学题算出正确中间值；thinking 用英文、正文用中文，证明是内部推理流非安慰剂）。
+- **effort 强度档位实测**（3模型×5档×3次）：effort 有效但天花板是 `high`。
+  - opus-4.8：low 162 → medium 342 → high 521（thinking 字符均值，单调强递增）；xhigh/max ≤ high（上游静默钳位）。
+  - opus-4.7：low 166 → high 386，同样 high 封顶。
+  - opus-4.6：effort 基本失效（high/xhigh 档 0 thinking）。
+  - 默认 high 正好卡峰值，xhigh/max 无增益。
+- **上游真实模型 ID**（实测）：opus 4.5/4.6/4.7/4.8、sonnet 4.5/4.6、haiku 4.5 可用；
+  sonnet 4.7/4.8 返回"模型不支持"。`-thinking` 后缀是反代/客户端侧概念，`map_model`
+  按版本号映射时剥离，上游无任何 `-thinking` 变体——thinking 是模型开关，非模型品种。
+
+### Notes
+- 312 个测试全绿（含 reasoning 事件解析 + 流式 thinking 块转换的新测试）。
+- 客户端侧：Claude Code 默认带 `redact-thinking-2026-02-12` beta header 隐藏 thinking（UI-only），
+  需 settings.json 设 `showThinkingSummaries: true` 才显示。
+
+## [v35] - 2026-05-31
+
+### Features —— 账号池分组（严格隔离）+ 缓存倍率热调
+
+- **账号池分组**：新增 SQLite `groups` + `credential_groups` 表 + `api_keys.group_id` 列
+  （`src/db/groups.rs`，幂等迁移）。apikey 绑定分组后**严格隔离**——只能用该分组内的账号，
+  组内全挂则请求失败（不回退全局池）。
+  - 认证中间件（`middleware.rs`）解析 apikey→允许凭据 id 集合，经 `Extension(AllowedCredentials)`
+    注入；provider `call_api_*_in_group` 透传到 `MultiTokenManager.acquire_context_with_session_and_group`
+    → `select_by_session_affinity` / `select_next_credential` / busy-vs-disabled 统计全部加分组过滤。
+  - 失败策略 **fail-open**：DB 解析失败时降级为不限制（放行），因分组定位是成本/缓存优化而非
+    安全租户隔离，可用性优先（体量小，偶发错误路由可接受）。
+  - Admin：`/groups` CRUD + `/credentials/{id}/group` + `/api-keys/{id}/group`；前端分组管理面板
+    + 每个 apikey/账号的分组下拉。
+- **缓存倍率全局热调**：`perceived_cache_hit_ratio` 从启动固定值改为 `MultiTokenManager` 的
+  `Mutex<Option<f64>>`，经 `/config/scheduling` 端点 + 调度面板运行时热调（persist 落盘），
+  每请求读 live 值。删除旧的 AppState→router 冗余传递链。
+
+### Notes
+- credential id 稳定（已有 id 保留回写、新增从 max+1），故用作分组映射 key 安全。
+- 严格隔离的所有选号路径已逐一审计无组外泄漏（含 affinity 跨 apikey 共享 map、自愈重选、空分组 bail）。
+
 ## [v34] - 2026-05-31
 
 ### Features —— 会话亲和调度（Session Affinity Scheduler）

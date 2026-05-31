@@ -562,6 +562,8 @@ pub struct MultiTokenManager {
     affinity_promote_threshold: AtomicU32,
     /// 会话亲和映射 TTL（秒，运行时可调）
     affinity_map_ttl_secs: AtomicU64,
+    /// 用户感知缓存命中放大比例（None=不放大；运行时可调，作用于响应 usage 上报）
+    perceived_cache_hit_ratio: Mutex<Option<f64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -696,6 +698,10 @@ impl MultiTokenManager {
         let rate_limit_cooldown_secs = config.rate_limit_cooldown_secs;
         let affinity_promote_threshold = config.affinity_promote_threshold.max(1);
         let affinity_map_ttl_secs = config.affinity_map_ttl_secs.max(1);
+        // 感知缓存放大比例：clamp 到 [0,1]（None 表示不放大）
+        let perceived_cache_hit_ratio = config
+            .perceived_cache_hit_ratio
+            .map(|r| r.clamp(0.0, 1.0));
         let manager = Self {
             config,
             proxy,
@@ -711,6 +717,7 @@ impl MultiTokenManager {
             affinity_map: Mutex::new(HashMap::new()),
             affinity_promote_threshold: AtomicU32::new(affinity_promote_threshold),
             affinity_map_ttl_secs: AtomicU64::new(affinity_map_ttl_secs),
+            perceived_cache_hit_ratio: Mutex::new(perceived_cache_hit_ratio),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -760,19 +767,21 @@ impl MultiTokenManager {
         model: Option<&str>,
         session_key: &str,
         exclude: &std::collections::HashSet<u64>,
+        allowed: Option<&std::collections::HashSet<u64>>,
     ) -> Option<(u64, KiroCredentials)> {
         let mut entries = self.entries.lock();
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 合格凭据的 id 集合（未禁用/支持模型/未 busy）
+        // 合格凭据的 id 集合（未禁用/支持模型/未 busy/在允许分组内）
         let eligible_ids: std::collections::HashSet<u64> = entries
             .iter()
             .filter(|e| {
                 !e.disabled
                     && (!is_opus || e.credentials.supports_opus())
                     && !exclude.contains(&e.id)
+                    && allowed.map(|s| s.contains(&e.id)).unwrap_or(true)
             })
             .map(|e| e.id)
             .collect();
@@ -865,6 +874,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         exclude: &std::collections::HashSet<u64>,
+        allowed: Option<&std::collections::HashSet<u64>>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
@@ -886,6 +896,10 @@ impl MultiTokenManager {
                 }
                 // v31：排除已 permit 满的凭据（同一 acquire 调用内）
                 if exclude.contains(&e.id) {
+                    return false;
+                }
+                // v35：分组隔离——仅在允许的凭据集合内选号
+                if allowed.map(|s| !s.contains(&e.id)).unwrap_or(false) {
                     return false;
                 }
                 true
@@ -941,6 +955,22 @@ impl MultiTokenManager {
         model: Option<&str>,
         session_key: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_session_and_group(model, session_key, None)
+            .await
+    }
+
+    /// 带会话亲和 + 分组隔离的凭据获取。
+    ///
+    /// `allowed_group`：`Some(set)` 时**严格隔离**——只在该 credential id 集合内选号，
+    /// 集合内全部不可用则返回错误（不回退全局池）；`None` 时使用全部凭据（历史行为）。
+    /// 空集合（分组存在但无成员）等价于"无可用凭据"。
+    pub async fn acquire_context_with_session_and_group(
+        &self,
+        model: Option<&str>,
+        session_key: Option<&str>,
+        allowed_group: Option<std::collections::HashSet<u64>>,
+    ) -> anyhow::Result<CallContext> {
+        let allowed = allowed_group.as_ref();
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -986,7 +1016,7 @@ impl MultiTokenManager {
                 let session_hit = if is_affinity && !session_affinity_tried {
                     session_affinity_tried = true;
                     session_key.and_then(|key| {
-                        self.select_by_session_affinity(model, key, &busy_ids)
+                        self.select_by_session_affinity(model, key, &busy_ids, allowed)
                     })
                 } else {
                     None
@@ -1003,6 +1033,10 @@ impl MultiTokenManager {
                         if busy_ids.contains(&current_id) {
                             return None;
                         }
+                        // v35：分组隔离——current_id 不在允许集合内时不复用
+                        if allowed.map(|s| !s.contains(&current_id)).unwrap_or(false) {
+                            return None;
+                        }
                         entries
                             .iter()
                             .find(|e| e.id == current_id && !e.disabled)
@@ -1014,7 +1048,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, &busy_ids);
+                    let mut best = self.select_next_credential(model, &busy_ids, allowed);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1033,7 +1067,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, &busy_ids);
+                            best = self.select_next_credential(model, &busy_ids, allowed);
                         }
                     }
 
@@ -1045,12 +1079,17 @@ impl MultiTokenManager {
                     } else {
                         // v31：区分"全 busy"和"全禁用"。前者不应该立即报错，
                         // 短 sleep + 清空 busy_ids 让下一轮拿到刚释放的并发槽。
+                        // v35：分组隔离时只统计允许集合内的凭据（严格隔离，不看组外账号）。
                         let (available_not_busy, available_total) = {
                             let entries = self.entries.lock();
-                            let total_avail = entries.iter().filter(|e| !e.disabled).count();
+                            let in_scope = |e: &CredentialEntry| {
+                                !e.disabled
+                                    && allowed.map(|s| s.contains(&e.id)).unwrap_or(true)
+                            };
+                            let total_avail = entries.iter().filter(|e| in_scope(e)).count();
                             let not_busy = entries
                                 .iter()
-                                .filter(|e| !e.disabled && !busy_ids.contains(&e.id))
+                                .filter(|e| in_scope(e) && !busy_ids.contains(&e.id))
                                 .count();
                             (not_busy, total_avail)
                         };
@@ -2375,6 +2414,33 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 获取感知缓存命中放大比例（None=不放大；Admin API / 请求路径读 live 值）
+    pub fn get_perceived_cache_hit_ratio(&self) -> Option<f64> {
+        *self.perceived_cache_hit_ratio.lock()
+    }
+
+    /// 设置感知缓存命中放大比例（Admin API）
+    ///
+    /// `Some(r)` 时 clamp 到 [0,1]；`None` 表示关闭放大、按真实/估算值上报。
+    /// 与其它运行时参数一致：先改内存、再落盘，落盘失败则回滚。
+    pub fn set_perceived_cache_hit_ratio(&self, ratio: Option<f64>) -> anyhow::Result<()> {
+        let ratio = ratio.map(|r| r.clamp(0.0, 1.0));
+        let previous = self.get_perceived_cache_hit_ratio();
+        if previous == ratio {
+            return Ok(());
+        }
+        *self.perceived_cache_hit_ratio.lock() = ratio;
+        if let Err(err) = self.persist_config_field(|c| c.perceived_cache_hit_ratio = ratio) {
+            *self.perceived_cache_hit_ratio.lock() = previous;
+            return Err(err);
+        }
+        match ratio {
+            Some(r) => tracing::info!("感知缓存命中放大比例已设置为: {:.4}", r),
+            None => tracing::info!("感知缓存命中放大已关闭（按真实值上报）"),
+        }
+        Ok(())
+    }
+
     /// 通用：重新加载配置文件、应用一处修改、回写（用于运行时可调参数持久化）
     fn persist_config_field<F: FnOnce(&mut Config)>(&self, apply: F) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -2741,10 +2807,10 @@ mod tests {
         let manager =
             MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
 
-        let k1_first = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        let k1_first = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new(), None).unwrap().0;
         // 100 次同 key 调用都应返回同一 id
         for _ in 0..100 {
-            let id = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+            let id = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new(), None).unwrap().0;
             assert_eq!(id, k1_first, "同 session_key 必须稳定");
         }
     }
@@ -2764,7 +2830,7 @@ mod tests {
         let mut distinct_ids = std::collections::HashSet::new();
         for i in 0..50 {
             let key = format!("conv-{}", i);
-            distinct_ids.insert(manager.select_by_session_affinity(None, &key, &std::collections::HashSet::new()).unwrap().0);
+            distinct_ids.insert(manager.select_by_session_affinity(None, &key, &std::collections::HashSet::new(), None).unwrap().0);
         }
         // 3 个凭据，50 个 key，应至少打到 2 个以上（LRU 轮转分布）
         assert!(
@@ -2787,29 +2853,29 @@ mod tests {
             MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
 
         let normal = manager
-            .select_by_session_affinity(None, "conv-x", &std::collections::HashSet::new())
+            .select_by_session_affinity(None, "conv-x", &std::collections::HashSet::new(), None)
             .unwrap()
             .0;
         // 把首次选中的 primary 加入 busy → 同会话应换到稳定次选
         let mut busy = std::collections::HashSet::new();
         busy.insert(normal);
         let alt = manager
-            .select_by_session_affinity(None, "conv-x", &busy)
+            .select_by_session_affinity(None, "conv-x", &busy, None)
             .unwrap()
             .0;
         assert_ne!(alt, normal);
 
         // select_next_credential 也应跳过 busy
-        let next_avoiding = manager.select_next_credential(None, &busy).unwrap().0;
+        let next_avoiding = manager.select_next_credential(None, &busy, None).unwrap().0;
         assert_ne!(next_avoiding, normal);
 
         // 全部加入 busy → 返回 None（主循环此时会 sleep 等待并发释放）
         for id in [1u64, 2, 3] {
             busy.insert(id);
         }
-        assert!(manager.select_next_credential(None, &busy).is_none());
+        assert!(manager.select_next_credential(None, &busy, None).is_none());
         assert!(manager
-            .select_by_session_affinity(None, "conv-x", &busy)
+            .select_by_session_affinity(None, "conv-x", &busy, None)
             .is_none());
     }
 
@@ -2825,9 +2891,9 @@ mod tests {
             MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
 
         // 找到 conv-aaa 当前选中的 id，把它禁用，应换到另一个
-        let original = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        let original = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new(), None).unwrap().0;
         manager.set_disabled(original, true).unwrap();
-        let after = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new()).unwrap().0;
+        let after = manager.select_by_session_affinity(None, "conv-aaa", &std::collections::HashSet::new(), None).unwrap().0;
         assert_ne!(after, original, "禁用后应跳到其它可用凭据");
     }
 
@@ -2848,7 +2914,7 @@ mod tests {
             let key = format!("sess-{}", i);
             ids.insert(
                 manager
-                    .select_by_session_affinity(None, &key, &std::collections::HashSet::new())
+                    .select_by_session_affinity(None, &key, &std::collections::HashSet::new(), None)
                     .unwrap()
                     .0,
             );
@@ -2871,7 +2937,7 @@ mod tests {
 
         // 建立映射，拿到 primary
         let primary = manager
-            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new())
+            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new(), None)
             .unwrap()
             .0;
         let mut busy = std::collections::HashSet::new();
@@ -2881,14 +2947,14 @@ mod tests {
         let mut alt = 0;
         for _ in 0..3 {
             alt = manager
-                .select_by_session_affinity(None, "conv-p", &busy)
+                .select_by_session_affinity(None, "conv-p", &busy, None)
                 .unwrap()
                 .0;
             assert_ne!(alt, primary);
         }
         // 此后即使 primary 重新可用（busy 清空），也应继续用已转正的 alt
         let after_promote = manager
-            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new())
+            .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new(), None)
             .unwrap()
             .0;
         assert_eq!(after_promote, alt, "次选连续命中 K 次后应转正为 primary");
@@ -3295,5 +3361,50 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[test]
+    fn perceived_cache_hit_ratio_runtime_tunable() {
+        // 默认 config 不配 ratio → None
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), None);
+
+        // 设置一个值（config_path=None → 仅内存生效，不落盘）
+        manager.set_perceived_cache_hit_ratio(Some(0.95)).unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(0.95));
+
+        // 越界值被 clamp 到 [0,1]
+        manager.set_perceived_cache_hit_ratio(Some(1.5)).unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(1.0));
+        manager.set_perceived_cache_hit_ratio(Some(-0.2)).unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(0.0));
+
+        // 显式关闭
+        manager.set_perceived_cache_hit_ratio(None).unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), None);
+    }
+
+    #[test]
+    fn perceived_cache_hit_ratio_inits_from_config_clamped() {
+        // config 里配了越界值，初始化时也应 clamp
+        let mut config = Config::default();
+        config.perceived_cache_hit_ratio = Some(2.0);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(1.0));
     }
 }
