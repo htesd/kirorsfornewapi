@@ -806,8 +806,8 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    // 原生 reasoningContentEvent 优先：直接作为 thinking 块放在最前
-    if !reasoning_content.is_empty() {
+    // 原生 reasoningContentEvent 优先：作为 thinking 块放最前（受 thinking_enabled 门控）
+    if !reasoning_content.is_empty() && thinking_enabled {
         content.push(json!({
             "type": "thinking",
             "thinking": reasoning_content,
