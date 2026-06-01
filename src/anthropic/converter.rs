@@ -463,6 +463,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
+    // 9.5 从历史中移除孤立的 tool_result（有结果但找不到对应的 tool_use）
+    // 客户端（如 Claude Code）反复 auto-compact 长对话时，可能压掉发起 tool_use 的
+    // assistant 消息却保留其 tool_result，残留成埋在 history 中段的孤儿。
+    // 上游 Kiro 对这种 result-without-use 同样返回 400 Improperly formed request，
+    // 这里反向清理：删掉 history 里任何 tool_use_id 无对应 tool_use 的 tool_result。
+    remove_orphaned_tool_results(&mut history);
+
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
@@ -841,6 +848,54 @@ fn remove_orphaned_tool_uses(
                 }
             }
         }
+    }
+}
+
+/// 从历史消息中移除孤立的 tool_result
+///
+/// 与 `remove_orphaned_tool_uses` 对称：Kiro API 要求每个 tool_result 必须有对应的
+/// tool_use，否则返回 400 Bad Request。客户端反复 auto-compact 长对话时可能压掉发起
+/// tool_use 的 assistant 消息却保留其 tool_result，残留成 history 中段的孤儿。
+/// 此函数先收集 history 中所有 tool_use_id，再删掉 user 消息里 tool_use_id 不在其中的
+/// tool_result。
+fn remove_orphaned_tool_results(history: &mut [Message]) {
+    use std::collections::HashSet;
+
+    // 1. 收集 history 中所有 tool_use_id（此时孤立 tool_use 已被前一步移除）
+    let all_tool_use_ids: HashSet<String> = history
+        .iter()
+        .filter_map(|msg| match msg {
+            Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+            Message::User(_) => None,
+        })
+        .flatten()
+        .map(|tu| tu.tool_use_id.clone())
+        .collect();
+
+    // 2. 删掉 user 消息里没有对应 tool_use 的 tool_result
+    let mut removed_ids: Vec<String> = Vec::new();
+    for msg in history.iter_mut() {
+        if let Message::User(user_msg) = msg {
+            let results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            results.retain(|r| {
+                let keep = all_tool_use_ids.contains(&r.tool_use_id);
+                if !keep {
+                    removed_ids.push(r.tool_use_id.clone());
+                }
+                keep
+            });
+        }
+    }
+
+    if !removed_ids.is_empty() {
+        tracing::warn!(
+            "从历史中移除了 {} 个孤立的 tool_result（无对应 tool_use，客户端压缩残留）：{:?}",
+            removed_ids.len(),
+            removed_ids
+        );
     }
 }
 
@@ -1720,6 +1775,54 @@ mod tests {
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_results_midhistory() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::conversation::UserMessage;
+
+        // 复现线上 400：history 中段有个 tool_result，但发起它的 assistant 消息
+        // 已被客户端 auto-compact 压掉（无对应 tool_use）。
+        // 同时保留一对正常配对的 tool_use/tool_result，确认不被误删。
+        let mut good_assistant = AssistantMessage::new("calling good tool");
+        good_assistant = good_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("use-good", "search").with_input(serde_json::json!({"q": "x"})),
+        ]);
+
+        // 构造一个带 tool_results 的 history user 消息
+        let mut orphan_ctx = UserInputMessageContext::new();
+        orphan_ctx = orphan_ctx.with_tool_results(vec![
+            ToolResult::success("use-orphan", "orphan result"), // 无对应 tool_use
+            ToolResult::success("use-good", "good result"),     // 有对应 tool_use
+        ]);
+        let mut orphan_user = UserMessage::new("here are results", "claude-opus-4.8");
+        orphan_user.user_input_message_context = orphan_ctx;
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("do something", "claude-opus-4.8")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: good_assistant,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: orphan_user,
+            }),
+        ];
+
+        remove_orphaned_tool_results(&mut history);
+
+        // 取出清理后的 tool_results
+        let remaining: Vec<String> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(&u.user_input_message.user_input_message_context.tool_results),
+                _ => None,
+            })
+            .flatten()
+            .map(|r| r.tool_use_id.clone())
+            .collect();
+
+        assert_eq!(remaining, vec!["use-good".to_string()], "孤儿 tool_result 应被删除，配对的应保留");
     }
 
     #[test]

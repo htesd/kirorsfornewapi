@@ -1,5 +1,28 @@
 # Changelog
 
+## [v39] - 2026-06-01
+
+### Fixes —— 孤儿 tool_result 导致超长对话上游 400
+
+- **根因**：客户端（Claude Code）反复 auto-compact 超长对话时，会压掉发起 `tool_use` 的
+  assistant 消息，却保留其 `tool_result`，在 history 中段残留**孤儿 tool_result**（有结果、无调用）。
+  上游 Kiro 对 result-without-use 返回 `400 Improperly formed request`，导致长对话流式请求 100% 失败。
+- **修复**：`src/anthropic/converter.rs` 新增 `remove_orphaned_tool_results`，与既有
+  `remove_orphaned_tool_uses` 对称。在 convert 流程 step 9.5（移除孤儿 tool_use 之后）收集
+  history 全部 `tool_use_id`，删掉 user 消息里无对应 tool_use 的 tool_result。
+  - 此前 `validate_tool_pairing` 只清理"孤儿 tool_use"和"当前消息的孤儿 tool_result"，
+    从不反向校验 **history 中段**的孤儿 tool_result —— 平时对话短不触发，388 消息超长对话才暴露。
+- **验证**：用线上真实失败请求体（388 消息、193 对工具调用、1 个孤儿 `tooluse_kSZAyw…`）
+  模拟，精确删除该孤儿（194→193），其余配对全部保留。新增单测
+  `test_remove_orphaned_tool_results_midhistory` 覆盖中段孤儿 + 配对共存场景。
+- **取证增强**：移除孤儿时 warn 日志带上被删的 tool_use_id 列表，便于线上复发定位。
+
+### Notes & Caveats
+
+- 纯后端修复，与 v38 的前端改动正交。对抗审查（Skeptic）通过：无 high 项；
+  实测确认无重复 tool_use_id/tool_result_id；空数组经 `skip_serializing_if` 已不序列化。
+- 已知局限（不阻塞）：按 ID 存在性匹配，不校验严格的 turn 内前置顺序；当前 Kiro 校验为存在性，足够。
+
 ## [v38] - 2026-06-01
 
 ### Features —— Admin UI 设置页重构 + 分组筛选 + 调度模式可视化
