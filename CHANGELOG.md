@@ -1,5 +1,32 @@
 # Changelog
 
+## [v38] - 2026-06-01
+
+### Features —— Admin UI 设置页重构 + 分组筛选 + 调度模式可视化
+
+- **独立「设置」页取代 512px 小弹窗**：原先 `SettingsDialog` 把 调度策略 / 账号池分组 / API Key
+  三块全挤进一个 `sm:max-w-lg` 弹窗，纵向堆叠、空间局促。改为顶部第三个 Tab「设置」
+  （`settings-page.tsx`），全宽布局、Card 分区：宽屏下调度策略与账号池分组并排，API Key 单独成行。
+  - 从弹窗抽出 API Key 管理为独立组件 `api-keys-panel.tsx`（去掉 Dialog 外壳）。
+  - 删除 `settings-dialog.tsx`。
+- **凭据列表按分组筛选**：列表头新增分组下拉（全部分组 / 各分组（含成员数）/ 未分组）。
+  用 `groups[].credentialIds` 反查每个凭据所属组，筛选后再分页；统计卡片随筛选联动
+  （「当前筛选 N / 共 M」）；切换筛选自动回第一页。此前所有账号一律平铺，账号多时难定位。
+- **Header 调度模式改为只读徽章**：移除顶部「负载模式切换」「限流冷却」两个按钮。
+  - 旧「负载模式切换」只在 `priority`/`balanced` 间切，**完全无视 `affinity`**：若当前是
+    会话亲和（推荐模式），按钮误显示「均衡负载」，且点一下会把系统**踢出 affinity** —— 真正的 footgun。
+  - 现改为只读展示当前模式（会话亲和 / 负载均衡 / 优先级固定），点击跳转设置页修改。
+    所有调度参数统一收敛到设置页的 `SchedulingPanel`（已支持完整 3 模式 + 亲和参数 + 缓存放大）。
+
+### Notes & Caveats
+
+- 文案修正：账号池分组从「严格隔离」改为「分组路由（fail-open）」，与实际 fail-open 行为
+  （组内账号全挂时回退全部账号）一致。
+- 纯前端改动，后端 API 未动；`/config/load-balancing`、`/config/rate-limit-cooldown`
+  端点及其 hook 保留（设置页经 `/config/scheduling` 统一读写，旧端点仍可用）。
+- 已用 Playwright + mock 数据本地验证：设置页三卡片、分组筛选（FREE 池 → 2/共7）、
+  只读模式徽章、标题不再竖排，均符合预期。
+
 ## [v36] - 2026-06-01
 
 ### Features —— 原生 thinking / reasoning 接入（reasoningContentEvent）

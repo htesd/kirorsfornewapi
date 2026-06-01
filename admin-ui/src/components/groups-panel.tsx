@@ -18,9 +18,10 @@ import { extractErrorMessage } from '@/lib/utils'
  *
  * - 建组 / 改名 / 删组
  * - 把账号（凭据）归入分组：每个账号一个下拉，选所属分组
- * - apikey 绑定分组在 API Key 列表里每行的下拉（见 settings-dialog）
+ * - apikey 绑定分组在 API Key 列表里每行的下拉（见 api-keys-panel）
  *
- * 严格隔离语义：apikey 绑定分组后只能用该分组内的账号；账号全挂则请求报错。
+ * 分组路由语义（fail-open）：apikey 绑定分组后优先用该分组内的账号；
+ * 组内账号全挂时回退到全部账号，优先保证可用而非硬隔离。
  */
 export function GroupsPanel() {
   const { data: groupsData, isLoading } = useGroups()
@@ -98,13 +99,10 @@ export function GroupsPanel() {
     c.email ? `#${c.id} ${c.email}` : `#${c.id}`
 
   return (
-    <div className="space-y-3 border-t pt-4">
-      <div>
-        <span className="text-sm font-medium">账号池分组</span>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          把账号分到不同分组，API Key 绑定分组后只能用该组内的账号（严格隔离）。
-        </p>
-      </div>
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        把账号分到不同分组，API Key 绑定分组后优先用该组内的账号（分组路由）。组内账号全挂时回退到全部账号，保证可用（fail-open）。
+      </p>
 
       {isLoading ? (
         <div className="text-sm text-muted-foreground py-2 text-center">加载中...</div>

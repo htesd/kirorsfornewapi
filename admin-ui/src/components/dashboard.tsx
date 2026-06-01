@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, ListTree, KeyRound } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, ListTree, Settings, Network } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,9 +13,9 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { RequestLogsPage } from '@/components/request-logs'
-import { SettingsDialog } from '@/components/settings-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useRateLimitCooldown, useSetRateLimitCooldown } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { SettingsPage } from '@/components/settings-page'
+import { useCredentials, useDeleteCredential, useResetFailure, useScheduling, useGroups } from '@/hooks/use-credentials'
+import { getCredentialBalance, forceRefreshToken, type SchedulingMode } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -23,14 +23,25 @@ interface DashboardProps {
   onLogout: () => void
 }
 
+const SCHEDULING_MODE_LABELS: Record<SchedulingMode, string> = {
+  affinity: '会话亲和',
+  balanced: '负载均衡',
+  priority: '优先级固定',
+}
+
+// 分组筛选：'all' = 全部，'ungrouped' = 未分组，数字 = 指定分组 id
+type GroupFilter = 'all' | 'ungrouped' | number
+const GROUP_FILTER_ALL = 'all'
+const GROUP_FILTER_UNGROUPED = 'ungrouped'
+
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [activeTab, setActiveTab] = useState<'credentials' | 'logs'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'logs' | 'settings'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
-  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [groupFilter, setGroupFilter] = useState<GroupFilter>('all')
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -56,26 +67,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-  const { data: cooldownData, isLoading: isLoadingCooldown } = useRateLimitCooldown()
-  const { mutate: setRateLimitCooldown, isPending: isSettingCooldown } = useSetRateLimitCooldown()
+  const { data: schedulingData } = useScheduling()
+  const { data: groupsData } = useGroups()
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  // credential_id → group_id 反查（用于按分组筛选凭据）
+  const groups = groupsData?.groups ?? []
+  const credGroupOf = new Map<number, number>()
+  for (const g of groups) {
+    for (const cid of g.credentialIds) credGroupOf.set(cid, g.id)
+  }
+
+  // 按分组筛选后的凭据列表
+  const allCredentials = data?.credentials ?? []
+  const filteredCredentials = allCredentials.filter((c) => {
+    if (groupFilter === 'all') return true
+    if (groupFilter === 'ungrouped') return !credGroupOf.has(c.id)
+    return credGroupOf.get(c.id) === groupFilter
+  })
+
+  // 计算分页（基于筛选后的列表）
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = filteredCredentials.slice(startIndex, endIndex)
+  const disabledCredentialCount = filteredCredentials.filter(credential => credential.disabled).length
+  const availableCount = filteredCredentials.filter(c => !c.disabled).length
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
 
-  // 当凭据列表变化时重置到第一页
+  // 当凭据列表或筛选条件变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [data?.credentials.length, groupFilter])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -497,38 +522,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
-
-    setLoadBalancingMode(newMode, {
-      onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
-      },
-      onError: (error) => {
-        toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
-    })
-  }
-
-  // 设置限流冷却时长（命中 429 后凭据自动停用多久）
-  const handleSetCooldown = () => {
-    const current = cooldownData?.cooldownSecs ?? 300
-    const input = window.prompt('命中 429 限流后，凭据自动停用多少秒（到点自动恢复）？', String(current))
-    if (input === null) return
-    const secs = Number(input.trim())
-    if (!Number.isFinite(secs) || secs < 0 || !Number.isInteger(secs)) {
-      toast.error('请输入非负整数秒数')
-      return
-    }
-    setRateLimitCooldown(secs, {
-      onSuccess: () => toast.success(`限流冷却已设为 ${secs}s`),
-      onError: (error) => toast.error(`设置失败: ${extractErrorMessage(error)}`),
-    })
-  }
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -567,33 +560,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
+            <button
+              onClick={() => setActiveTab('settings')}
+              className="flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              title="当前调度模式（点击进入设置修改）"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleSetCooldown}
-              disabled={isLoadingCooldown || isSettingCooldown}
-              title="命中 429 限流后，凭据自动停用的冷却时长（到点自动恢复）"
-            >
-              {isLoadingCooldown ? '加载中...' : `限流冷却 ${cooldownData?.cooldownSecs ?? 300}s`}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setSettingsDialogOpen(true)}
-              title="配置反代访问密钥（支持多个）"
-            >
-              <KeyRound className="h-4 w-4 mr-2" />
-              API Keys
-            </Button>
+              <Network className="h-3.5 w-3.5" />
+              {schedulingData ? SCHEDULING_MODE_LABELS[schedulingData.mode] : '加载中…'}
+            </button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -633,22 +607,42 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <ListTree className="inline h-4 w-4 mr-2" />
             请求日志
           </button>
+          <button
+            className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === 'settings'
+                ? 'border-primary text-foreground'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => setActiveTab('settings')}
+          >
+            <Settings className="inline h-4 w-4 mr-2" />
+            设置
+          </button>
         </div>
 
         {activeTab === 'logs' ? (
           <RequestLogsPage />
+        ) : activeTab === 'settings' ? (
+          <SettingsPage />
         ) : (
         <>
-        {/* 统计卡片 */}
+        {/* 统计卡片（随分组筛选联动） */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
+                {groupFilter === 'all' ? '凭据总数' : '当前筛选'}
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
+              <div className="text-2xl font-bold">
+                {filteredCredentials.length}
+                {groupFilter !== 'all' && (
+                  <span className="text-sm font-normal text-muted-foreground ml-2">
+                    / 共 {data?.total || 0}
+                  </span>
+                )}
+              </div>
             </CardContent>
           </Card>
           <Card>
@@ -658,7 +652,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+              <div className="text-2xl font-bold text-green-600">{availableCount}</div>
             </CardContent>
           </Card>
           <Card>
@@ -678,9 +672,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-4 shrink-0">
+              <h2 className="text-xl font-semibold whitespace-nowrap">凭据管理</h2>
+              {groups.length > 0 && (
+                <select
+                  value={groupFilter === 'all' ? GROUP_FILTER_ALL : groupFilter === 'ungrouped' ? GROUP_FILTER_UNGROUPED : String(groupFilter)}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setGroupFilter(v === GROUP_FILTER_ALL ? 'all' : v === GROUP_FILTER_UNGROUPED ? 'ungrouped' : Number(v))
+                  }}
+                  className="h-8 rounded-md border border-input bg-transparent px-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  title="按账号分组筛选"
+                >
+                  <option value={GROUP_FILTER_ALL}>全部分组</option>
+                  <option value={GROUP_FILTER_UNGROUPED}>未分组</option>
+                  {groups.map((g) => (
+                    <option key={g.id} value={String(g.id)}>
+                      {g.name}（{g.credentialIds.length}）
+                    </option>
+                  ))}
+                </select>
+              )}
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -690,7 +703,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -766,10 +779,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+          {filteredCredentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
+                {allCredentials.length === 0 ? '暂无凭据' : '当前分组下暂无凭据'}
               </CardContent>
             </Card>
           ) : (
@@ -800,7 +813,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（共 {filteredCredentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
@@ -818,12 +831,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
         </>
         )}
       </main>
-
-      {/* 反代 API Key 设置对话框 */}
-      <SettingsDialog
-        open={settingsDialogOpen}
-        onOpenChange={setSettingsDialogOpen}
-      />
 
       {/* 余额对话框 */}
       <BalanceDialog

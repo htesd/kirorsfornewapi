@@ -96,13 +96,10 @@ export function SchedulingPanel() {
   const isAffinity = mode === 'affinity'
 
   return (
-    <div className="space-y-3 border-t pt-4">
-      <div>
-        <span className="text-sm font-medium">调度策略</span>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          控制请求如何在多个上游账号间分配。改动即时生效并持久化。
-        </p>
-      </div>
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        控制请求如何在多个上游账号间分配。改动即时生效并持久化。
+      </p>
 
       {isLoading ? (
         <div className="text-sm text-muted-foreground py-2 text-center">加载中...</div>
