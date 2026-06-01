@@ -1,27 +1,37 @@
 # Changelog
 
-## [v39] - 2026-06-01
+## [v40] - 2026-06-01
 
-### Fixes —— 孤儿 tool_result 导致超长对话上游 400
+### Fixes —— 空响应/截断/上游错误不再静默记 success（致"断流"）
 
-- **根因**：客户端（Claude Code）反复 auto-compact 超长对话时，会压掉发起 `tool_use` 的
-  assistant 消息，却保留其 `tool_result`，在 history 中段残留**孤儿 tool_result**（有结果、无调用）。
-  上游 Kiro 对 result-without-use 返回 `400 Improperly formed request`，导致长对话流式请求 100% 失败。
-- **修复**：`src/anthropic/converter.rs` 新增 `remove_orphaned_tool_results`，与既有
-  `remove_orphaned_tool_uses` 对称。在 convert 流程 step 9.5（移除孤儿 tool_use 之后）收集
-  history 全部 `tool_use_id`，删掉 user 消息里无对应 tool_use 的 tool_result。
-  - 此前 `validate_tool_pairing` 只清理"孤儿 tool_use"和"当前消息的孤儿 tool_result"，
-    从不反向校验 **history 中段**的孤儿 tool_result —— 平时对话短不触发，388 消息超长对话才暴露。
-- **验证**：用线上真实失败请求体（388 消息、193 对工具调用、1 个孤儿 `tooluse_kSZAyw…`）
-  模拟，精确删除该孤儿（194→193），其余配对全部保留。新增单测
-  `test_remove_orphaned_tool_results_midhistory` 覆盖中段孤儿 + 配对共存场景。
-- **取证增强**：移除孤儿时 warn 日志带上被删的 tool_use_id 列表，便于线上复发定位。
+- **根因**：opus 流式响应偶发三种异常都被当成正常完成：
+  (1) 上游下发 `error`/`exception` 事件——此前只打日志后 `return Vec::new()`，流仍按 success 收尾；
+  (2) 上游 HTTP 200 但 body 零事件（空响应），有时还先挂起 ~124s；
+  (3) 读流 IO 中断——只记日志，仍给客户端发正常 `message_stop`。
+  三者都让客户端（Claude Code）以为"干净完成"而**不重试**，用户侧表现为"断流"（工具/bash 回合尤其明显）。
+- **修复**（`stream.rs` + `handlers.rs`）：
+  - 新增结构化 `StreamFailure` 枚举（`UpstreamError` / `UpstreamException` / `EmptyResponse` / `StreamIo`），
+    `error_kind()` 分类便于排查，取代此前的静默丢弃。
+  - 空响应检测（`produced_any_content()` 为假）收进 `generate_final_events`，**live 与 buffered 两条路径共用**。
+  - 失败时向客户端补发**终止性 `error` 事件**并提前返回（不再发自相矛盾的 `message_stop`），
+    关闭半开块、对 thinking 块（含 fake `<thinking>` 路径）补发 `signature_delta` 保证结构合法
+    —— 客户端据此识别为可重试错误。
+  - `mark_failure`/`failure_kind` 方法封装，`ContentLengthExceededException` 仍视为正常 `max_tokens`。
+- **验证**：对抗审查 2 轮（Skeptic + Architect），修掉 buffered 路径/IO 分支/thinking 签名/taxonomy 共识问题；
+  7 个新单测覆盖空响应、上游 error、IO、fake thinking 签名、ContentLength 例外。
+
+### Fixes —— 孤儿 tool_result 致超长对话上游 400（合并自未部署的 v39）
+
+- 客户端反复 auto-compact 超长对话时压掉发起 `tool_use` 的 assistant 消息却保留其 `tool_result`，
+  history 中段残留孤儿 `tool_result`，上游 Kiro 返回 `400 Improperly formed request`。
+  新增 `remove_orphaned_tool_results`（与 `remove_orphaned_tool_uses` 对称），convert step 9.5 反向清理。
+  用线上真实失败体验证（194→193 精确删 1 孤儿）。
 
 ### Notes & Caveats
 
-- 纯后端修复，与 v38 的前端改动正交。对抗审查（Skeptic）通过：无 high 项；
-  实测确认无重复 tool_use_id/tool_result_id；空数组经 `skip_serializing_if` 已不序列化。
-- 已知局限（不阻塞）：按 ID 存在性匹配，不校验严格的 turn 内前置顺序；当前 Kiro 校验为存在性，足够。
+- 已知限制（不阻塞）：124s 挂起期间靠 ping 续命，须等上游 EOF/720s 超时才报错；未做无内容看门狗。
+- 仍在调查：bash 回合空响应的**上游侧根因**（账号 #9 命中 Kiro "suspicious activity" 风控限流频繁）。
+  本次修复让这类失败对客户端可见可重试，是缓解；根因需进一步抓上游请求/响应。
 
 ## [v38] - 2026-06-01
 
