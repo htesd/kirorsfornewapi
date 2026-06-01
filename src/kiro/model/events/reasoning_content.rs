@@ -16,13 +16,20 @@ use super::base::EventPayload;
 
 /// 推理内容事件
 ///
-/// 包含模型推理过程的流式片段。
+/// 包含模型推理过程的流式片段。Kiro 在 thinking 流的**最后一帧**会单独下发
+/// `{"signature": "..."}`（无 text），这是 Anthropic 原生 thinking 签名（protobuf
+/// 编码，含模型代号/通道信息）。反代需把它透传到 Anthropic thinking 块的 `signature`
+/// 字段，否则签名为空会被检测平台判为"签名校验失败"。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningContentEvent {
     /// 推理内容片段
     #[serde(default)]
     pub text: String,
+
+    /// thinking 签名（仅最后一帧携带，protobuf base64）。透传给 Anthropic thinking 块。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
@@ -41,6 +48,7 @@ impl Default for ReasoningContentEvent {
     fn default() -> Self {
         Self {
             text: String::new(),
+            signature: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -75,5 +83,22 @@ mod tests {
         let json = r#"{"someOtherField":1}"#;
         let event: ReasoningContentEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.text, "");
+    }
+
+    #[test]
+    fn parses_signature_frame() {
+        // thinking 流最后一帧：只有 signature，没有 text
+        let json = r#"{"signature":"EtMBCmMIDhABGAIqQBhQ"}"#;
+        let event: ReasoningContentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.text, "");
+        assert_eq!(event.signature.as_deref(), Some("EtMBCmMIDhABGAIqQBhQ"));
+    }
+
+    #[test]
+    fn signature_absent_in_text_frames() {
+        let json = r#"{"text":" calculating"}"#;
+        let event: ReasoningContentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.text, " calculating");
+        assert!(event.signature.is_none());
     }
 }

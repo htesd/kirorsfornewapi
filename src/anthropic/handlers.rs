@@ -703,6 +703,8 @@ async fn handle_non_stream_request(
     let mut text_content = String::new();
     // 原生 reasoningContentEvent 累积的推理内容（与正文 text 分开）
     let mut reasoning_content = String::new();
+    // 原生 reasoning 签名（protobuf base64，上游 thinking 流最后一帧携带）
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -729,6 +731,12 @@ async fn handle_non_stream_request(
                         Event::ReasoningContent(r) => {
                             // 原生推理流，累积为独立 thinking 块（不混入正文）
                             reasoning_content.push_str(&r.text);
+                            // 上游在 thinking 流最后一帧单独下发 signature，透传到 thinking 块
+                            if let Some(sig) = &r.signature {
+                                if !sig.is_empty() {
+                                    reasoning_signature = Some(sig.clone());
+                                }
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -831,7 +839,7 @@ async fn handle_non_stream_request(
         content.push(json!({
             "type": "thinking",
             "thinking": reasoning_content,
-            "signature": ""
+            "signature": reasoning_signature.clone().unwrap_or_default()
         }));
         // 正文按普通 text 输出（原生 reasoning 已独立，不再做 <thinking> 标签提取）
         if !text_content.is_empty() {

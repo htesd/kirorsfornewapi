@@ -1,5 +1,30 @@
 # Changelog
 
+## [v42] - 2026-06-02
+
+### Features —— thinking 签名透传（修复第三方检测"签名校验失败"）
+
+- **背景**：cctest.ai 等检测平台有一项"签名校验 —— 解析 Protobuf 签名识别渠道来源"。
+  我们的 thinking 块 `signature` 字段一直是空字符串 `""`，导致该项判定失败、综合评分被压低。
+- **关键发现（实测抓帧）**：Kiro 上游 `reasoningContentEvent` 在 thinking 流的**最后一帧**
+  会单独下发 `{"signature":"<protobuf base64>"}`（无 text），base64 解码可见内嵌
+  `claude-quince`（模型代号）+ `thinking` —— 这是**真实的 Anthropic thinking 签名，Kiro 原样透传**。
+  即问题不是"Kiro 不给签名"，而是反代解析层只取了 `text`、把签名丢进 `extra` 兜底字段吞掉了
+  （与 v36 之前 thinking 内容被整段丢弃同源：上游给了，反代没接住）。
+- **修复**（3 处协同）：
+  - `reasoning_content.rs`：`ReasoningContentEvent` 新增 `signature: Option<String>` 字段。
+  - `stream.rs`：`StreamContext` 新增 `reasoning_signature`，在 `text.is_empty()` 早返回**之前**
+    捕获签名帧；`close_reasoning_block_if_open` 透传真实签名到 `signature_delta`（无签名回退空占位）；
+    关闭后清空签名防跨块泄漏。
+  - `handlers.rs`（非流式）：捕获 `r.signature` 并写入 thinking 块 JSON。
+- **验证**：临时 debug 探针抓到真实上游签名帧确诊；对抗审查（Skeptic）判 NO ISSUES；
+  4 个新单测（签名帧解析、流式透传、无签名回退、非流式）。全量 332 测试通过。
+
+### Notes & Caveats
+
+- "行为验证"项是否随签名修复连带改善，待 cctest 实测确认。
+- fake `<thinking>` 标签回退路径无上游签名，仍发空占位（结构合法，符合预期）。
+
 ## [v41] - 2026-06-02
 
 ### Fixes —— 空 content 消息致会话被"毒化"（确定性 400，连环断流的另一半）

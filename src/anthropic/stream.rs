@@ -589,6 +589,9 @@ pub struct StreamContext {
     /// 本次响应是否出现过原生 reasoning。一旦出现，正文走纯 text（绕过 fake
     /// `<thinking>` 标签解析）——因为推理已在独立通道，正文不会再含 `<thinking>`。
     native_reasoning_seen: bool,
+    /// 上游下发的原生 thinking 签名（protobuf base64，仅 thinking 流最后一帧携带）。
+    /// 关闭 thinking 块时透传到 Anthropic `signature_delta`，替代占位空签名。
+    reasoning_signature: Option<String>,
     /// 流的终态失败（None = 正常）。区分上游 error 事件 / 上游 exception / 空响应 / IO 错误，
     /// 供日志按 error_kind 分类、并据此向客户端补发终止性 `error` 事件。
     /// 此前上游 error/exception 仅打日志后丢弃、空响应按 success 收尾，导致客户端收到“空响应正常结束”。
@@ -664,6 +667,7 @@ impl StreamContext {
             emitted_cache_creation: None,
             reasoning_block_active: false,
             native_reasoning_seen: false,
+            reasoning_signature: None,
             failure: None,
         }
     }
@@ -763,7 +767,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
-            Event::ReasoningContent(r) => self.process_reasoning_content(&r.text),
+            Event::ReasoningContent(r) => self.process_reasoning_content(&r.text, &r.signature),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -878,7 +882,15 @@ impl StreamContext {
     /// reasoning 再发正文。若 reasoning **迟于**正文到达（text 块已开），无法再合法地
     /// 在其前插入 thinking 块——此时丢弃该迟到 reasoning（仅日志），避免产生非法块顺序
     /// 导致客户端解析失败。实测上游均为 reasoning 先行，此分支是防御性兜底。
-    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+    fn process_reasoning_content(&mut self, text: &str, signature: &Option<String>) -> Vec<SseEvent> {
+        // 先捕获签名（上游在 thinking 流最后一帧单独下发 {"signature":...}，无 text）。
+        // 必须在 text.is_empty() 早返回之前处理，否则签名帧会被直接丢弃。
+        if let Some(sig) = signature {
+            if !sig.is_empty() {
+                self.reasoning_signature = Some(sig.clone());
+            }
+        }
+
         if text.is_empty() {
             return Vec::new();
         }
@@ -937,22 +949,23 @@ impl StreamContext {
 
     /// 关闭开着的原生 reasoning thinking 块（若有）。
     ///
-    /// Anthropic 规范：thinking 块结束前需发一个 `signature_delta`（哪怕签名为空字符串），
-    /// 再发 `content_block_stop`。`reasoning_block_active` 守卫保证不会重复关闭，
-    /// 故签名无条件发送（每个 thinking 块恰好一次）。
+    /// Anthropic 规范：thinking 块结束前需发一个 `signature_delta`，再发 `content_block_stop`。
+    /// 优先透传上游下发的真实签名（protobuf）；若上游未给则回退空签名（仍满足结构合法性）。
+    /// `reasoning_block_active` 守卫保证不会重复关闭，故签名无条件发送（每个 thinking 块恰好一次）。
     fn close_reasoning_block_if_open(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if !self.reasoning_block_active {
             return events;
         }
         if let Some(idx) = self.thinking_block_index {
-            // signature_delta（占位空签名，满足客户端对 thinking 块结构的期望）
+            // signature_delta：透传上游真实签名（若有），否则占位空签名
+            let signature = self.reasoning_signature.clone().unwrap_or_default();
             events.push(SseEvent::new(
                 "content_block_delta",
                 json!({
                     "type": "content_block_delta",
                     "index": idx,
-                    "delta": { "type": "signature_delta", "signature": "" }
+                    "delta": { "type": "signature_delta", "signature": signature }
                 }),
             ));
             if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
@@ -960,6 +973,9 @@ impl StreamContext {
             }
         }
         self.reasoning_block_active = false;
+        // 签名属于刚关闭的这个 thinking 块，清空以防泄漏到后续块（防御性：
+        // 现有顺序保护已使原生路径每轮仅一个 thinking 块，此处兜底上游行为变化）。
+        self.reasoning_signature = None;
         events
     }
 
@@ -2337,6 +2353,54 @@ mod tests {
         Event::ReasoningContent(
             serde_json::from_value(json).expect("build ReasoningContentEvent"),
         )
+    }
+
+    fn reasoning_signature_event(sig: &str) -> Event {
+        // 上游 thinking 流最后一帧：仅 signature，无 text
+        let json = json!({ "signature": sig });
+        Event::ReasoningContent(
+            serde_json::from_value(json).expect("build ReasoningContentEvent"),
+        )
+    }
+
+    #[test]
+    fn native_reasoning_signature_passthrough() {
+        // 上游下发真实签名后，关闭 thinking 块时 signature_delta 应携带该签名（非空占位）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&reasoning_event("thinking...")));
+        // 上游最后一帧：签名（无 text）
+        events.extend(ctx.process_kiro_event(&reasoning_signature_event("EtMBCmMIDhABGAIqQBhQ")));
+        // 正文到来触发 thinking 块关闭
+        events.extend(ctx.process_assistant_response("answer"));
+
+        let sig_event = events.iter().find(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        });
+        assert!(sig_event.is_some(), "应发 signature_delta");
+        assert_eq!(
+            sig_event.unwrap().data["delta"]["signature"], "EtMBCmMIDhABGAIqQBhQ",
+            "signature_delta 应透传上游真实签名，而非空占位"
+        );
+    }
+
+    #[test]
+    fn native_reasoning_no_signature_falls_back_empty() {
+        // 上游未给签名时，仍发空签名占位（保持结构合法，向后兼容）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_kiro_event(&reasoning_event("thinking...")));
+        events.extend(ctx.process_assistant_response("answer"));
+
+        let sig_event = events.iter().find(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        });
+        assert!(sig_event.is_some(), "无签名时仍应发 signature_delta 占位");
+        assert_eq!(sig_event.unwrap().data["delta"]["signature"], "");
     }
 
     #[test]
