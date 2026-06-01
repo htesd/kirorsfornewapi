@@ -343,6 +343,35 @@ impl SseStateManager {
             .any(|b| b.block_type != "thinking")
     }
 
+    /// 关闭所有已开启但未关闭的内容块，返回对应的事件。
+    /// 用于错误/空响应终止前清理 SSE 结构，避免残留半开块。
+    /// thinking 类型块在 stop 前补发 `signature_delta`（哪怕空签名），满足 Anthropic 对
+    /// thinking 块结构的要求——覆盖 fake `<thinking>` 标签解析产生的块（它们不走
+    /// reasoning_block_active 路径）。
+    fn close_all_open_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                if block.block_type == "thinking" {
+                    events.push(SseEvent::new(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": { "type": "signature_delta", "signature": "" }
+                        }),
+                    ));
+                }
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": index }),
+                ));
+                block.stopped = true;
+            }
+        }
+        events
+    }
+
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -560,6 +589,47 @@ pub struct StreamContext {
     /// 本次响应是否出现过原生 reasoning。一旦出现，正文走纯 text（绕过 fake
     /// `<thinking>` 标签解析）——因为推理已在独立通道，正文不会再含 `<thinking>`。
     native_reasoning_seen: bool,
+    /// 流的终态失败（None = 正常）。区分上游 error 事件 / 上游 exception / 空响应 / IO 错误，
+    /// 供日志按 error_kind 分类、并据此向客户端补发终止性 `error` 事件。
+    /// 此前上游 error/exception 仅打日志后丢弃、空响应按 success 收尾，导致客户端收到“空响应正常结束”。
+    failure: Option<StreamFailure>,
+}
+
+/// 流式响应的终态失败类型。用结构化枚举区分四类，避免把“上游真错”和“本地判定空响应”混为一谈。
+#[derive(Debug, Clone)]
+pub enum StreamFailure {
+    /// 上游下发了 error 事件
+    UpstreamError(String),
+    /// 上游下发了 exception 事件（ContentLengthExceeded 除外，那是正常的 max_tokens）
+    UpstreamException(String),
+    /// 上游 HTTP 200 但流中零实质内容（无正文/工具/推理）
+    EmptyResponse,
+    /// 读取上游响应流时 IO 错误（连接中断等）
+    StreamIo(String),
+}
+
+impl StreamFailure {
+    /// 日志用的 error_kind 分类
+    pub fn error_kind(&self) -> &'static str {
+        match self {
+            StreamFailure::UpstreamError(_) => "upstream_error",
+            StreamFailure::UpstreamException(_) => "upstream_exception",
+            StreamFailure::EmptyResponse => "empty_response",
+            StreamFailure::StreamIo(_) => "stream_io",
+        }
+    }
+
+    /// 发给客户端 error 事件的 message
+    pub fn client_message(&self) -> String {
+        match self {
+            StreamFailure::UpstreamError(m) => format!("upstream error event: {}", m),
+            StreamFailure::UpstreamException(m) => format!("upstream exception: {}", m),
+            StreamFailure::EmptyResponse => {
+                "上游返回空响应（200 但流中无任何内容事件），可能是生成超时或瞬时限流".to_string()
+            }
+            StreamFailure::StreamIo(m) => format!("reading upstream stream failed: {}", m),
+        }
+    }
 }
 
 impl StreamContext {
@@ -594,6 +664,7 @@ impl StreamContext {
             emitted_cache_creation: None,
             reasoning_block_active: false,
             native_reasoning_seen: false,
+            failure: None,
         }
     }
 
@@ -620,6 +691,33 @@ impl StreamContext {
                 }
             }
         })
+    }
+
+    /// 本次响应是否产出过任何实质内容（正文 token / 工具调用 / 原生 reasoning）。
+    ///
+    /// 用于检测"上游 200 但 body 完全为空（零事件）"的空响应：此时 output_tokens=0、
+    /// 无 tool_use、无 reasoning。这类请求此前按 success 收尾，客户端收到空回答却以为正常完成。
+    pub fn produced_any_content(&self) -> bool {
+        self.output_tokens > 0
+            || !self.tool_block_indices.is_empty()
+            || self.native_reasoning_seen
+    }
+
+    /// 标记流的终态失败（首个失败优先，不覆盖）。封装内部状态，避免外部直接改字段。
+    pub fn mark_failure(&mut self, failure: StreamFailure) {
+        if self.failure.is_none() {
+            self.failure = Some(failure);
+        }
+    }
+
+    /// 当前失败的 error_kind（None = 无失败）
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        self.failure.as_ref().map(|f| f.error_kind())
+    }
+
+    /// 当前失败发给日志/客户端的 message（None = 无失败）
+    pub fn failure_message(&self) -> Option<String> {
+        self.failure.as_ref().map(|f| f.client_message())
     }
 
     /// 生成初始事件序列 (message_start + 文本块 start)
@@ -712,15 +810,29 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                // 记录上游错误，流结束时据此判定为失败（此前只打日志后丢弃，
+                // 导致空响应被当作 success 正常收尾）
+                self.mark_failure(StreamFailure::UpstreamError(format!(
+                    "{} - {}",
+                    error_code, error_message
+                )));
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
+                // 处理 ContentLengthExceededException：这是正常的 max_tokens 截断，
+                // 模型已产出内容到上限，不算失败
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    // 其它异常（如 "Encountered an unexpected error..."）记为上游错误，
+                    // 避免静默吞错导致客户端收到空响应
+                    self.mark_failure(StreamFailure::UpstreamException(format!(
+                        "{} - {}",
+                        exception_type, message
+                    )));
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
@@ -1203,6 +1315,37 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // 空响应检测（在此统一处理，使 live 与 buffered 两条路径都覆盖）：
+        // 流结束时若无任何已记录失败、且零实质内容产出 → 判定为空响应。
+        if self.failure.is_none() && !self.produced_any_content() {
+            self.mark_failure(StreamFailure::EmptyResponse);
+            tracing::warn!(
+                "检测到空响应：上游零内容产出，prompt_tokens≈{}",
+                self.context_input_tokens.unwrap_or(self.input_tokens)
+            );
+        }
+
+        // 终态失败：向客户端补发终止性 Anthropic `error` 事件并立即返回。
+        // 不再追加 message_delta/message_stop，避免「error 后又 message_stop」的自相矛盾序列，
+        // 让客户端干净识别失败并重试。
+        if let Some(failure) = self.failure.clone() {
+            // 先按规范闭合开着的 reasoning thinking 块（发 signature_delta + stop），
+            // 再关闭其余开着的块——避免残留半开块或缺签名的非法 thinking 块。
+            events.extend(self.close_reasoning_block_if_open());
+            events.extend(self.state_manager.close_all_open_blocks());
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": failure.client_message(),
+                    }
+                }),
+            ));
+            return events;
+        }
+
         // 若流结束时原生 reasoning thinking 块仍开着（纯思考无后续正文），先干净关闭
         events.extend(self.close_reasoning_block_if_open());
 
@@ -1360,6 +1503,12 @@ impl BufferedStreamContext {
     /// 设置感知缓存命中放大比例（透传到内部 StreamContext）
     pub fn set_perceived_cache_hit_ratio(&mut self, r: Option<f64>) {
         self.inner.set_perceived_cache_hit_ratio(r);
+    }
+
+    /// 标记流的终态失败（透传到内部 StreamContext）。
+    /// 用于 buffered 路径的 IO 错误等场景，使最终事件发出终止性 error。
+    pub fn mark_failure(&mut self, failure: StreamFailure) {
+        self.inner.mark_failure(failure);
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -2292,5 +2441,105 @@ mod tests {
                 || (e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
         });
         assert!(!has_thinking, "thinking 关闭时不应发出任何 thinking 内容");
+    }
+
+    #[test]
+    fn produced_any_content_detects_empty() {
+        // 全新上下文、未产出任何内容 → 视为空响应
+        let ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        assert!(!ctx.produced_any_content(), "零产出应判定为空响应");
+    }
+
+    #[test]
+    fn produced_any_content_true_after_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("hello");
+        assert!(ctx.produced_any_content(), "产出正文后不应判定为空");
+    }
+
+    #[test]
+    fn empty_response_emits_terminal_error_event() {
+        // 空响应：generate_final_events 应自动检测零内容、发 error 事件且不带 message_stop（终止性）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 不产出任何内容，直接 finalize
+
+        let events = ctx.generate_final_events();
+        let has_error = events.iter().any(|e| e.event == "error"
+            && e.data["error"]["type"] == "api_error");
+        let has_message_stop = events.iter().any(|e| e.event == "message_stop");
+        assert!(has_error, "空响应应发出 error 事件");
+        assert!(!has_message_stop, "error 是终止事件，不应再发 message_stop");
+        assert_eq!(ctx.failure_kind(), Some("empty_response"));
+    }
+
+    #[test]
+    fn non_empty_response_no_error_event() {
+        // 有正文产出 → 正常 message_stop，无 error
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("hello world");
+
+        let events = ctx.generate_final_events();
+        let has_error = events.iter().any(|e| e.event == "error");
+        let has_message_stop = events.iter().any(|e| e.event == "message_stop");
+        assert!(!has_error, "正常响应不应有 error 事件");
+        assert!(has_message_stop, "正常响应应有 message_stop");
+        assert_eq!(ctx.failure_kind(), None);
+    }
+
+    #[test]
+    fn upstream_error_event_sets_failure() {
+        // 上游 error 事件应被记录为 UpstreamError（此前被静默丢弃）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalError".to_string(),
+            error_message: "boom".to_string(),
+        });
+        assert_eq!(ctx.failure_kind(), Some("upstream_error"));
+        assert!(ctx.failure_message().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn content_length_exceeded_is_not_failure() {
+        // ContentLengthExceededException 是正常的 max_tokens 截断，不应记为失败
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("partial answer");
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert_eq!(ctx.failure_kind(), None, "ContentLength 异常不算失败");
+    }
+
+    #[test]
+    fn failure_path_signs_open_fake_thinking_block() {
+        // thinking 启用 + fake `<thinking>` 标签路径：流中途出错时，开着的 thinking 块
+        // 必须在 stop 前补发 signature_delta（否则客户端可能拒收非法 thinking 块）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 制造一个未闭合的 fake thinking 块
+        let _ = ctx.process_assistant_response("<thinking>reasoning in progress");
+        // 上游出错
+        let _ = ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalError".to_string(),
+            error_message: "boom".to_string(),
+        });
+
+        let events = ctx.generate_final_events();
+        // 找 thinking 块的 signature_delta 与 content_block_stop 顺序
+        let sig_pos = events.iter().position(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        });
+        let has_error = events.iter().any(|e| e.event == "error");
+        assert!(sig_pos.is_some(), "开着的 fake thinking 块应补发 signature_delta");
+        assert!(has_error, "应发终止性 error 事件");
+        // signature 恰好一次（不重复）
+        let sig_count = events.iter().filter(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        }).count();
+        assert_eq!(sig_count, 1, "signature_delta 应恰好一次");
     }
 }

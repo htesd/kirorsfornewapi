@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::logging;
 use super::middleware::{AllowedCredentials, AppState};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, SseEvent, StreamContext, StreamFailure};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 use crate::db::{LogRecorder, RequestRecordBuilder, RequestStatus};
@@ -576,18 +576,23 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 标记 IO 失败：generate_final_events 据此向客户端补发终止性 error 事件，
+                            // 让客户端把中断识别为错误并重试（此前只记日志、仍发正常 message_stop，
+                            // 客户端以为干净结束而不重试）。mark_failure 首个失败优先，故若此前已记
+                            // 上游 error/exception，则保留它——日志也据 failure_kind 与客户端保持一致。
+                            ctx.mark_failure(StreamFailure::StreamIo(e.to_string()));
                             let final_events = ctx.generate_final_events();
-                            // 流 IO 错误：记 error（仍记录已产出的部分 token）
                             if let Some(mut b) = builder.take() {
                                 b.set_prompt_tokens(ctx.context_input_tokens.unwrap_or(ctx.input_tokens));
                                 b.set_completion_tokens(ctx.output_tokens);
+                                let kind = ctx.failure_kind().unwrap_or("stream_io");
                                 logging::finish_with_error(
                                     recorder.as_ref(),
                                     b,
-                                    "stream_io",
+                                    kind,
                                     "stream",
-                                    "io_error",
-                                    e.to_string(),
+                                    kind,
+                                    ctx.failure_message().unwrap_or_else(|| e.to_string()),
                                 );
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -597,7 +602,8 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, builder, recorder)))
                         }
                         None => {
-                            // 流正常结束：记 success
+                            // generate_final_events 内部会做空响应检测：零内容产出时标记
+                            // EmptyResponse 并发终止性 error 事件（live 与 buffered 共用此逻辑）。
                             let final_events = ctx.generate_final_events();
                             if let Some(mut b) = builder.take() {
                                 // 把流式累计的 token 写进日志：output 是累计估算值，
@@ -607,7 +613,21 @@ fn create_sse_stream(
                                 if let Some(cr) = ctx.emitted_cache_read {
                                     b.set_cache_read_reported(cr);
                                 }
-                                logging::finish(recorder.as_ref(), b, RequestStatus::Success);
+                                if let Some(kind) = ctx.failure_kind() {
+                                    // 上游 error/exception 或空响应：据实记为错误，
+                                    // error_kind 按失败类型区分（upstream_error / upstream_exception / empty_response）
+                                    logging::finish_with_error(
+                                        recorder.as_ref(),
+                                        b,
+                                        kind,
+                                        "stream",
+                                        kind,
+                                        ctx.failure_message().unwrap_or_default(),
+                                    );
+                                } else {
+                                    // 流正常结束：记 success
+                                    logging::finish(recorder.as_ref(), b, RequestStatus::Success);
+                                }
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -1203,7 +1223,9 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                // 标记 IO 失败：finish_and_get_all_events 据此发终止性 error 事件，
+                                // 让 buffered 客户端把中断识别为错误并重试（对齐 live 路径）
+                                ctx.mark_failure(StreamFailure::StreamIo(e.to_string()));
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
