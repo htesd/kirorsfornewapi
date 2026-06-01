@@ -486,6 +486,9 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 11. 构建 UserInputMessageContext
+    // 记录是否有工具结果（validated_tool_results 随后会被移动进 context，这里先存一份布尔量
+    // 供后续当前消息的空内容兜底判断使用）。
+    let has_tool_results = !validated_tool_results.is_empty();
     // 工具放置策略：
     // - 默认：放 currentMessage（每轮全价重发，无法缓存）
     // - 实验开关开启且有历史用户消息：放 history[0] 前缀，进可缓存区
@@ -510,8 +513,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // 兜底：仅当 text、tool_results、images 全空时才占位（Kiro 判 400 Improperly formed request）。
+    // 注意：只在"彻底空"时兜底——"无文本但有 tool_results"是正常工具结果回合，
+    // 线上证据表明 Kiro 接受其空文本，绝不能注入占位符（否则污染每个工具回合）。
+    // 这种全空 user 回合极少见（通常是客户端异常）。
+    let content = if text_content.trim().is_empty() && !has_tool_results && images.is_empty() {
+        tracing::warn!(
+            "当前 user 消息为空（无 text/tool_result/image），已用占位符兜底以避免 Kiro 400"
+        );
+        EMPTY_CONTENT_PLACEHOLDER.to_string()
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -874,33 +887,49 @@ fn remove_orphaned_tool_results(history: &mut [Message]) {
 
     // 2. 删掉 user 消息里没有对应 tool_use 的 tool_result
     let mut removed_ids: Vec<String> = Vec::new();
+    let mut repaired_empty = 0usize;
     for msg in history.iter_mut() {
         if let Message::User(user_msg) = msg {
-            let results = &mut user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results;
-            results.retain(|r| {
+            let uim = &mut user_msg.user_input_message;
+            uim.user_input_message_context.tool_results.retain(|r| {
                 let keep = all_tool_use_ids.contains(&r.tool_use_id);
                 if !keep {
                     removed_ids.push(r.tool_use_id.clone());
                 }
                 keep
             });
+            // 修复排序隐患：merge_user_messages 当初对"无文本但有 tool_result"的回合
+            // 故意保留空 content（合法工具结果回合）。若这里把它仅有的 tool_result 作为孤儿
+            // 删光，该消息就变成"彻底空"（content/tool_results/images 全空），Kiro 会判 400。
+            // 此处补占位符兜底，保证清理后不残留空 content 消息。
+            if uim.content.trim().is_empty()
+                && uim.user_input_message_context.tool_results.is_empty()
+                && uim.images.is_empty()
+            {
+                uim.content = EMPTY_CONTENT_PLACEHOLDER.to_string();
+                repaired_empty += 1;
+            }
         }
     }
 
     if !removed_ids.is_empty() {
         tracing::warn!(
-            "从历史中移除了 {} 个孤立的 tool_result（无对应 tool_use，客户端压缩残留）：{:?}",
+            "从历史中移除了 {} 个孤立的 tool_result（无对应 tool_use，客户端压缩残留）：{:?}；其中 {} 条 user 消息因此变空已补占位符",
             removed_ids.len(),
-            removed_ids
+            removed_ids,
+            repaired_empty
         );
     }
 }
 
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
+
+/// 空内容占位符。Kiro API 要求 message 的 content 字段非空，否则返回
+/// 400 "Improperly formed request"。当 assistant/user 消息没有任何可见文本时
+/// （纯 tool_use 回合，或上游空响应残留），用单个空格兜底保持 schema 合法。
+/// 选用单空格而非语义标记：避免污染对话内容，且与历史上"纯 tool_use"行为一致。
+const EMPTY_CONTENT_PLACEHOLDER: &str = " ";
 
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
@@ -1117,7 +1146,20 @@ fn merge_user_messages(
     }
 
     let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
+    // 兜底：text + tool_results + images 全空时，Kiro 会判 400 Improperly formed request。
+    // 注意只在"彻底空"时兜底——"无文本但有 tool_results"是正常的工具结果回合，
+    // Kiro 接受其空文本，不能注入占位符（否则污染每个工具回合）。
+    let content = if content.trim().is_empty()
+        && all_tool_results.is_empty()
+        && all_images.is_empty()
+    {
+        tracing::warn!(
+            "历史 user 消息为空（无 text/tool_result/image），已用占位符兜底以避免 Kiro 400"
+        );
+        EMPTY_CONTENT_PLACEHOLDER.to_string()
+    } else {
+        content
+    };
     let mut user_msg = UserMessage::new(&content, model_id);
 
     if !all_images.is_empty() {
@@ -1189,10 +1231,20 @@ fn convert_assistant_message(
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
-    } else {
+    } else if !text_content.is_empty() {
         text_content
+    } else {
+        // text 和 thinking 均为空。
+        // - 有 tool_use：正常的"纯工具调用"回合，用空格占位（Kiro 要求 content 非空）。
+        // - 无 tool_use：这是一条彻底空的 assistant 消息，几乎都是上游空响应/断流后
+        //   被客户端写回历史的残留。Kiro 对空 content 返回 400 Improperly formed request，
+        //   且该消息会一直留在历史里，导致整个会话每一轮都确定性失败。必须兜底为非空并告警。
+        if tool_uses.is_empty() {
+            tracing::warn!(
+                "历史中检测到空 assistant 消息（无 text/thinking/tool_use），疑似上游空响应残留，已用占位符兜底以避免 Kiro 400 毒化会话"
+            );
+        }
+        EMPTY_CONTENT_PLACEHOLDER.to_string()
     };
 
     let mut assistant = AssistantMessage::new(final_content);
@@ -1230,8 +1282,14 @@ fn merge_assistant_messages(
         }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
+    let content = if content_parts.is_empty() {
+        // 合并后无任何文本内容：无论有无 tool_use，content 都不能为空（Kiro 要求非空）。
+        if all_tool_uses.is_empty() {
+            tracing::warn!(
+                "合并后的 assistant 消息为空（无 text/tool_use），疑似上游空响应残留，已用占位符兜底以避免 Kiro 400"
+            );
+        }
+        EMPTY_CONTENT_PLACEHOLDER.to_string()
     } else {
         content_parts.join("\n\n")
     };
@@ -1823,6 +1881,136 @@ mod tests {
             .collect();
 
         assert_eq!(remaining, vec!["use-good".to_string()], "孤儿 tool_result 应被删除，配对的应保留");
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_results_repairs_emptied_user_message() {
+        use crate::kiro::model::requests::conversation::UserMessage;
+
+        // 排序隐患回归：tool-result-only 的 user 回合（空 content，仅靠 tool_result 合法），
+        // 其唯一的 tool_result 是孤儿被删光后，消息变"彻底空" → 必须被占位符修复，
+        // 否则会以 content="" 到达 Kiro 触发 400。
+        let mut orphan_ctx = UserInputMessageContext::new();
+        orphan_ctx = orphan_ctx.with_tool_results(vec![
+            ToolResult::success("use-orphan-only", "orphan result"), // 无对应 tool_use
+        ]);
+        let mut empty_after = UserMessage::new("", "claude-opus-4.8"); // 空文本（工具结果回合）
+        empty_after.user_input_message_context = orphan_ctx;
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("hi", "claude-opus-4.8")),
+            Message::Assistant(HistoryAssistantMessage::new("hello")),
+            Message::User(HistoryUserMessage {
+                user_input_message: empty_after,
+            }),
+        ];
+
+        remove_orphaned_tool_results(&mut history);
+
+        if let Message::User(u) = &history[2] {
+            assert!(
+                u.user_input_message.user_input_message_context.tool_results.is_empty(),
+                "孤儿 tool_result 应被删除"
+            );
+            assert!(
+                !u.user_input_message.content.is_empty(),
+                "被删空的 user 消息必须补占位符，不能残留空 content"
+            );
+        } else {
+            panic!("history[2] 应为 user 消息");
+        }
+    }
+
+    #[test]
+    fn test_empty_assistant_message_never_produces_empty_content() {
+        // 复现线上确定性 400：上游空响应被客户端写回历史后，下一轮 converter
+        // 必须保证 content 非空，否则 Kiro 返回 "Improperly formed request" 毒化会话。
+        let mut tool_name_map = HashMap::new();
+
+        // case 1: 彻底空的 assistant 消息（无 text/thinking/tool_use）
+        let empty_msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([]),
+        };
+        let converted = convert_assistant_message(&empty_msg, &mut tool_name_map).unwrap();
+        assert!(
+            !converted.assistant_response_message.content.is_empty(),
+            "空 assistant 消息的 content 不能为空"
+        );
+
+        // case 2: content 为空字符串
+        let empty_str_msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!(""),
+        };
+        let converted2 = convert_assistant_message(&empty_str_msg, &mut tool_name_map).unwrap();
+        assert!(
+            !converted2.assistant_response_message.content.is_empty(),
+            "空字符串 assistant 消息的 content 不能为空"
+        );
+
+        // case 3: merge 多条全空 assistant 消息（连续断流场景）
+        let m1 = super::super::types::Message { role: "assistant".to_string(), content: serde_json::json!([]) };
+        let m2 = super::super::types::Message { role: "assistant".to_string(), content: serde_json::json!("") };
+        let refs: Vec<&super::super::types::Message> = vec![&m1, &m2];
+        let merged = merge_assistant_messages(&refs, &mut tool_name_map).unwrap();
+        assert!(
+            !merged.assistant_response_message.content.is_empty(),
+            "合并多条全空 assistant 消息后 content 不能为空"
+        );
+    }
+
+    #[test]
+    fn test_empty_assistant_with_tool_use_still_placeholder() {
+        // 纯工具调用回合（无 text/thinking）仍应得到非空占位符，且保留 tool_use
+        let mut tool_name_map = HashMap::new();
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "tu-1", "name": "read", "input": {"path": "/x"}}
+            ]),
+        };
+        let converted = convert_assistant_message(&msg, &mut tool_name_map).unwrap();
+        assert!(!converted.assistant_response_message.content.is_empty());
+        assert!(converted.assistant_response_message.tool_uses.is_some());
+    }
+
+    #[test]
+    fn test_merge_user_messages_empty_gets_placeholder() {
+        // 历史 user 消息彻底为空（无 text/tool_result/image）→ 必须兜底为非空
+        let empty = super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!([]),
+        };
+        let refs: Vec<&super::super::types::Message> = vec![&empty];
+        let merged = merge_user_messages(&refs, "claude-opus-4.8").unwrap();
+        assert!(
+            !merged.user_input_message.content.is_empty(),
+            "彻底空的历史 user 消息 content 不能为空"
+        );
+    }
+
+    #[test]
+    fn test_merge_user_messages_tool_result_only_no_placeholder() {
+        // "无文本但有 tool_result" 是正常工具结果回合：Kiro 接受空文本，
+        // 不应注入占位符（线上证据：count=98 等工具回合 content="" 仍成功）。
+        let tr = super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "tu-9", "content": "result text"}
+            ]),
+        };
+        let refs: Vec<&super::super::types::Message> = vec![&tr];
+        let merged = merge_user_messages(&refs, "claude-opus-4.8").unwrap();
+        // 文本应保持为空（不被占位符污染），但 tool_result 应存在
+        assert_eq!(
+            merged.user_input_message.content, "",
+            "工具结果回合不应被占位符污染文本"
+        );
+        assert!(
+            !merged.user_input_message.user_input_message_context.tool_results.is_empty(),
+            "tool_result 应被保留"
+        );
     }
 
     #[test]

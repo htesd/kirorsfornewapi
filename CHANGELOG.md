@@ -1,5 +1,41 @@
 # Changelog
 
+## [v41] - 2026-06-02
+
+### Fixes —— 空 content 消息致会话被"毒化"（确定性 400，连环断流的另一半）
+
+- **根因（与 v40 互为因果链两端）**：
+  1. opus 偶发返回空响应（v40 处理的"断流"）；
+  2. 客户端（Claude Code）把这条**空 assistant 消息**写回对话历史；
+  3. 下一轮请求带上它，converter 产出 `content=""` 的 assistant 消息；
+  4. Kiro 对空 content 返回 `400 Improperly formed request`；
+  5. 该空消息**永久留在历史里** → 此后每一轮都确定性 400，整个会话被"毒化"。
+- **线上铁证**：某会话 `messages_count` 维度上 98→成功、**99→连续失败 57 次（40 分钟反复重试全 400）**、
+  101→成功；且 v40 的孤儿 tool_result 清理日志**一次未触发**，证明此为另一类缺陷（空 content，非孤儿）。
+- **缺陷定位**：`convert_assistant_message` 的占位符兜底**只覆盖"有 tool_use 但无文本"**，
+  漏了"text/thinking/tool_use 全空"（`final_content=""`）；`merge_assistant_messages`、
+  `merge_user_messages`、当前消息构建同样存在空 content 路径。
+- **修复**（`converter.rs`）：四条转换路径统一兜底——`assistant 转换` / `assistant 合并` /
+  `user 合并` / `当前 user 消息`，空内容用 `EMPTY_CONTENT_PLACEHOLDER`（单空格）占位，并打 `warn!` 日志自证。
+  - **关键边界**：仅在"彻底空"（text + tool_results + images 全空）时兜底；
+    "无文本但有 tool_results"是正常工具结果回合（线上证据：count=98 等工具回合 `content=""` 仍成功），
+    **绝不注入占位符**，否则污染每个工具回合。
+- **验证**：对抗审查（Architect 判设计 sound + Skeptic 2 轮）；Skeptic 首轮指出 `merge_user_messages`
+  对称缺口（HIGH），已补齐并加回归测试;另一 HIGH（empty-text+tool_results）经线上证据判为误报、文档化为有意行为。
+  4 个新单测，全量 327 测试通过。
+
+### Design Rationale
+
+- **为何占位而非删除空消息**：删除会改变 user/assistant 角色交替结构、可能跨越丢失的 assistant 回合合并
+  user 轮次，破坏 Kiro 前缀缓存稳定性;单字节空格占位对序列化前缀扰动最小，且与历史"纯 tool_use"行为一致。
+- **为何单空格而非语义标记**：`[empty]` 之类会成为模型可见内容、污染对话语义;空格最小语义、保持 schema 合法。
+- v40 让空响应对客户端可见可重试（缓解症状）;v41 修转换层让已被毒化的历史不再确定性 400（修因之一半）。
+
+### Notes & Caveats
+
+- 仍在调查：bash 回合空响应的**上游侧根因**（账号命中 Kiro "suspicious activity" 风控限流频繁）。
+  v40+v41 让这类失败可见、可重试、不毒化会话，但上游为何吐空响应仍需进一步抓包定位。
+
 ## [v40] - 2026-06-01
 
 ### Fixes —— 空响应/截断/上游错误不再静默记 success（致"断流"）
