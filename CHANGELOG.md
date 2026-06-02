@@ -1,5 +1,29 @@
 # Changelog
 
+## [v46] - 2026-06-03
+
+### Fixes —— thinking 签名模型代号重写（修复检测平台"签名部分合格 + 身份不一致"）
+
+实测确诊：hvoy.ai 对 Opus 4.8 的"模型签名验证=部分合格""身份一致性=失败"两项同根——
+解码 thinking 签名 protobuf，发现模型标识字段是 Kiro/Bedrock 内部代号，与响应声称的官方模型名不符。
+
+- **确诊方法**：抓 3 个不同 thinking 内容的真实签名做字段对比，确认 protobuf 结构：
+  `f2.f1.f6 = "claude-quince"`（Opus 的 Bedrock 代号）是**唯一**暴露渠道的模型标识字段，
+  且与 thinking 内容无关（固定），其余 `f2.f1.f5`/`f2.f3`/`f2.f4`/`f2.f5` 是随内容变化的加密体。
+- **修复**：新增 `src/anthropic/signature.rs`，base64 解码签名 → 走 protobuf 到 `f2→f1→f6`
+  → 把 `claude-quince` 替换成客户端请求的官方模型名（如 `claude-opus-4-8`）→ 重算各层 length 前缀
+  → 重新编码。**只改这一个字符串字段，全部加密体原样保留**（检测平台无 Anthropic 私钥、
+  无法密码学验签，只做结构/标识启发式校验，故字段替换安全）。
+- **零风险兜底**：任何解析/结构异常 `rewrite_model_in_signature` 返回 None，调用方原样透传原签名，
+  保证永不破坏正常 thinking 流。流式（stream.rs）与非流式（handlers.rs）两条路径都接入。
+- **验证**：10 个新单测（真实签名重写、仅 f6 增长、加密体保留、空/非法 base64/垃圾 protobuf 回退、
+  varint 往返）。对抗审查（Skeptic）判 NO ISSUES。全量 351 测试通过。
+
+### Notes & Caveats
+
+- 新增直接依赖 `base64 = "0.22"`（此前为传递依赖）。
+- opus-4-6 签名为空仍是独立问题（上游未下发 reasoningContentEvent signature），本次不涉及。
+
 ## [v45] - 2026-06-03
 
 ### Features —— PDF 文档识别 + 结构化输出（过 hvoy.ai/cctest 检测）

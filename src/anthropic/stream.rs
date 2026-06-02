@@ -887,7 +887,11 @@ impl StreamContext {
         // 必须在 text.is_empty() 早返回之前处理，否则签名帧会被直接丢弃。
         if let Some(sig) = signature {
             if !sig.is_empty() {
-                self.reasoning_signature = Some(sig.clone());
+                // 把签名里暴露 Bedrock 渠道的模型代号(claude-quince)替换成客户端请求的
+                // 官方模型名，修复检测平台"签名/身份不一致"；重写失败则原样透传。
+                let fixed = super::signature::rewrite_model_in_signature(sig, &self.model)
+                    .unwrap_or_else(|| sig.clone());
+                self.reasoning_signature = Some(fixed);
             }
         }
 

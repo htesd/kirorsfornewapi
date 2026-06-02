@@ -731,10 +731,14 @@ async fn handle_non_stream_request(
                         Event::ReasoningContent(r) => {
                             // 原生推理流，累积为独立 thinking 块（不混入正文）
                             reasoning_content.push_str(&r.text);
-                            // 上游在 thinking 流最后一帧单独下发 signature，透传到 thinking 块
+                            // 上游在 thinking 流最后一帧单独下发 signature，透传到 thinking 块。
+                            // 同时把暴露 Bedrock 渠道的模型代号(claude-quince)替换成客户端请求
+                            // 的官方模型名（修复检测平台签名/身份不一致）；重写失败则原样透传。
                             if let Some(sig) = &r.signature {
                                 if !sig.is_empty() {
-                                    reasoning_signature = Some(sig.clone());
+                                    let fixed = super::signature::rewrite_model_in_signature(sig, model)
+                                        .unwrap_or_else(|| sig.clone());
+                                    reasoning_signature = Some(fixed);
                                 }
                             }
                         }

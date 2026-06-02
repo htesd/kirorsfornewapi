@@ -28,6 +28,7 @@ mod handlers;
 mod logging;
 mod middleware;
 mod router;
+mod signature;
 mod stream;
 pub mod types;
 mod usage;
