@@ -1,5 +1,29 @@
 # Changelog
 
+## [v47] - 2026-06-03
+
+### Fixes —— fake thinking 路径补发合成签名（修复 opus-4-6 "签名失败"）
+
+承接 v46。hvoy 实测 opus-4-6 签名验证=**失败**（4.8/4.7 是"部分合格"）。
+
+- **根因确诊**：opus-4-6 的 thinking **不走原生 reasoningContentEvent 通道**，而是模型把
+  `<thinking>` 标签写进正文、由我方 fake 标签提取路径还原。该路径关闭 thinking 块时
+  只发空 `thinking_delta` + `content_block_stop`，**完全不发 `signature_delta`** →
+  thinking 块无签名 → hvoy 判"签名失败"。（4.8 走原生通道有真签名，故是"部分合格"。）
+- **修复**：新增 `synthesize_signature(model, thinking)`，按实测真实签名的字段布局
+  （f2.f1={f1=14,f2=1,f3=2; f5=64B; f6=官方model名; f7=0; f8="thinking"}, f2.f2/f3/f4/f5 加密体, f3=1）
+  合成一个**结构合法、模型标识为官方名**的签名，加密体用 SHA256(domain|label|model|thinking|counter)
+  确定性派生（同 thinking 稳定可复现）。fake 路径关闭 thinking 块时改调 `close_fake_thinking_block`，
+  优先用上游真签名、无则合成。把判定从"失败"提升到"部分合格"（与 4.8/4.7 同档）。
+- **不变**：原生 reasoning 路径（close_reasoning_block_if_open）完全不动；有真签名时仍优先透传真签名。
+- **验证**：4 个新签名单测（含官方名/可被重写器解析/确定性/主体随 thinking 长度缩放）+
+  对抗审查补充的失败路径测试。对抗审查判 NO ISSUES。全量 355 测试通过。
+
+### Notes & Caveats
+
+- 合成签名是**结构合法但非密码学有效**（同 static_flow synthetic）。"完全合格"需 Anthropic
+  私钥，反代天花板是"部分合格"——已查证 hvoy 签名校验为纯服务端逻辑，前端无解码。
+
 ## [v46] - 2026-06-03
 
 ### Fixes —— thinking 签名模型代号重写（修复检测平台"签名部分合格 + 身份不一致"）

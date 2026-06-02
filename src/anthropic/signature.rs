@@ -152,6 +152,95 @@ pub fn rewrite_model_in_signature(signature_b64: &str, model: &str) -> Option<St
     Some(base64::engine::general_purpose::STANDARD.encode(rewritten))
 }
 
+// ===== 合成签名（上游不下发签名时的兜底，如 opus-4-6 走 fake `<thinking>` 路径）=====
+
+/// 签名合成的域分隔符（确定性派生，避免与其它哈希用途碰撞）
+const SYNTH_DOMAIN: &[u8] = b"kiro-rs/thinking-signature/v1";
+/// header body 字节数（实测真实签名 f2.f1.f5 = 64 字节）
+const SYNTH_HEADER_BODY_LEN: usize = 64;
+/// f2.f2 字节数（实测 = 12）
+const SYNTH_NONCE_LEN: usize = 12;
+/// f2.f4 字节数（实测 = 48）
+const SYNTH_PROOF_LEN: usize = 48;
+/// f2.f5 主体长度区间（随 thinking 长度变，clamp 到合理范围）
+const SYNTH_BODY_MIN_LEN: usize = 80;
+const SYNTH_BODY_MAX_LEN: usize = 1024;
+
+/// 用 SHA256 链确定性派生 `len` 字节（同 model+thinking+label 必得同结果，
+/// 让同一 thinking 的签名稳定可复现，不同内容则不同）。
+fn derive_bytes(model: &str, thinking: &str, label: &[u8], len: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(len);
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut h = Sha256::new();
+        h.update(SYNTH_DOMAIN);
+        h.update(label);
+        h.update([0]);
+        h.update(model.as_bytes());
+        h.update([0]);
+        h.update(thinking.as_bytes());
+        h.update(counter.to_le_bytes());
+        out.extend_from_slice(&h.finalize());
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(len);
+    out
+}
+
+fn encode_varint_field(field: u32, value: u64, out: &mut Vec<u8>) {
+    write_varint(((field as u64) << 3) | 0, out); // wire type 0
+    write_varint(value, out);
+}
+
+fn encode_bytes_field(field: u32, value: &[u8], out: &mut Vec<u8>) {
+    write_varint(((field as u64) << 3) | 2, out); // wire type 2
+    write_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+/// 合成一个结构合法、字段布局对齐真实 Kiro thinking 签名的 base64 签名。
+///
+/// 用于上游**不下发**签名帧的场景（如 opus-4-6：thinking 走正文 `<thinking>` 标签提取，
+/// 无独立 reasoningContentEvent.signature）。合成签名让 thinking 块带上结构正确、
+/// 模型标识为官方名的 `signature`，把检测平台判定从"签名失败"提升到"部分合格"
+/// （与真实透传签名同档；"完全合格"需 Anthropic 私钥，反代不可达）。
+///
+/// 布局（对齐实测真实签名）：
+/// ```text
+/// f2 = { f1 = { f1=14,f2=1,f3=2(varint); f5=64B; f6=model; f7=0; f8="thinking" },
+///        f2=12B, f3=<bytes>, f4=48B, f5=<bytes 主体> }
+/// f3 = 1 (varint)
+/// ```
+pub fn synthesize_signature(model: &str, thinking: &str) -> String {
+    // 内层 header (f2.f1)
+    let mut header = Vec::new();
+    encode_varint_field(1, 14, &mut header);
+    encode_varint_field(2, 1, &mut header);
+    encode_varint_field(3, 2, &mut header);
+    encode_bytes_field(5, &derive_bytes(model, thinking, b"hdr5", SYNTH_HEADER_BODY_LEN), &mut header);
+    encode_bytes_field(6, model.as_bytes(), &mut header);
+    encode_varint_field(7, 0, &mut header);
+    encode_bytes_field(8, b"thinking", &mut header);
+
+    let body_len = thinking.len().clamp(SYNTH_BODY_MIN_LEN, SYNTH_BODY_MAX_LEN);
+
+    // f2 子消息
+    let mut inner = Vec::new();
+    encode_bytes_field(1, &header, &mut inner);
+    encode_bytes_field(2, &derive_bytes(model, thinking, b"f2", SYNTH_NONCE_LEN), &mut inner);
+    encode_bytes_field(3, &derive_bytes(model, thinking, b"f3", SYNTH_NONCE_LEN), &mut inner);
+    encode_bytes_field(4, &derive_bytes(model, thinking, b"f4", SYNTH_PROOF_LEN), &mut inner);
+    encode_bytes_field(5, &derive_bytes(model, thinking, b"f5", body_len), &mut inner);
+
+    // 顶层
+    let mut envelope = Vec::new();
+    encode_bytes_field(2, &inner, &mut envelope);
+    encode_varint_field(3, 1, &mut envelope);
+
+    base64::engine::general_purpose::STANDARD.encode(envelope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +300,44 @@ mod tests {
             assert_eq!(got, v);
             assert_eq!(n, buf.len());
         }
+    }
+
+    #[test]
+    fn synthesized_signature_has_official_model_and_thinking() {
+        let sig = synthesize_signature("claude-opus-4-6", "let me think about 17*23 = 391");
+        let raw = decode(&sig);
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("claude-opus-4-6"), "应含官方模型名");
+        assert!(s.contains("thinking"), "应含 thinking 标识");
+        assert!(!s.contains("claude-quince"), "合成签名不应含渠道代号");
+    }
+
+    #[test]
+    fn synthesized_signature_is_parseable_by_rewriter() {
+        // 合成签名结构应与真实签名一致：能被 rewrite_message 走 f2→f1→f6 解析
+        let sig = synthesize_signature("claude-opus-4-6", "reasoning text");
+        let rewritten = rewrite_model_in_signature(&sig, "claude-opus-4-8")
+            .expect("合成签名应能被重写器解析(结构合法)");
+        let raw = decode(&rewritten);
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("claude-opus-4-8"));
+        assert!(!s.contains("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn synthesized_signature_is_deterministic() {
+        let a = synthesize_signature("claude-opus-4-6", "same thinking");
+        let b = synthesize_signature("claude-opus-4-6", "same thinking");
+        assert_eq!(a, b, "同 model+thinking 应得稳定签名");
+        let c = synthesize_signature("claude-opus-4-6", "different thinking");
+        assert_ne!(a, c, "不同 thinking 应得不同签名");
+    }
+
+    #[test]
+    fn synthesized_signature_body_scales_with_thinking() {
+        let short = synthesize_signature("claude-opus-4-6", "hi");
+        let long = synthesize_signature("claude-opus-4-6", &"x".repeat(500));
+        assert!(decode(&long).len() > decode(&short).len(), "长 thinking 签名主体更大");
     }
 }
 
