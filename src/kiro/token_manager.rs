@@ -754,14 +754,17 @@ impl MultiTokenManager {
     ///
     /// 按 session_key 做有状态会话亲和选号（v3）。
     ///
-    /// - 新会话：选 last_used_at 最旧（LRU，最久未调用）的合格凭据为 primary，写入映射。
+    /// - 新会话：在合格凭据里按**优先级分层 LRU** 选 primary —— 先取最高优先级层
+    ///   （priority 数值最小），层内再选 last_selected_at 最旧（最久未调用）者，写入映射。
     /// - 老会话且 primary 健康：一直用 primary（缓存留在该账号，命中率最高）。
-    /// - primary 冷却/不可用：走稳定 alt（整个冷却期固定，保 alt 缓存）；alt 连续命中
-    ///   达 `affinity_promote_threshold` 次则转正为 primary —— 逐步排空热账号，
+    /// - primary 冷却/不可用：走稳定 alt（同样按分层 LRU 选，整个冷却期固定，保 alt 缓存）；
+    ///   alt 连续命中达 `affinity_promote_threshold` 次则转正为 primary —— 逐步排空热账号，
     ///   避免所有会话反复抢同一个被限流的号。
     /// - 映射按 `affinity_map_ttl_secs` 惰性淘汰。
     ///
-    /// 不可用（disabled/冷却中/不支持模型/busy）的凭据天然被滤掉。
+    /// 不可用（disabled/冷却中/不支持模型/busy）的凭据天然被滤掉。并发占满的账号已进
+    /// `exclude`，故最高优先级层全忙时其成员离开合格集合，分层 LRU 的"最高层"自动下移到
+    /// 下一层 —— 即"除非最高优先级层无并发可用，否则不调用下层"。
     fn select_by_session_affinity(
         &self,
         model: Option<&str>,
@@ -789,11 +792,22 @@ impl MultiTokenManager {
             return None;
         }
 
-        // LRU：在合格集合中选 last_selected_at 最旧（None 视为最久未用）
+        // 分层 LRU：先锁定合格集合里的**最高优先级层**（priority 数值最小），
+        // 在该层内部再选 last_selected_at 最旧（None 视为最久未用）。
+        // 并发占满的账号已被 exclude 滤出 eligible，故最高层全忙时其成员自动离开集合，
+        // 最小 priority 随之下移到下一层 —— 实现"除非最高层无并发可用才下沉"的级联。
         let lru_id = |ids: &std::collections::HashSet<u64>| -> u64 {
-            entries
+            // 1. 该候选集合内的最高优先级（priority 最小值）
+            let top_priority = entries
                 .iter()
                 .filter(|e| ids.contains(&e.id))
+                .map(|e| e.credentials.priority)
+                .min()
+                .unwrap();
+            // 2. 仅在最高优先级层内做 LRU
+            entries
+                .iter()
+                .filter(|e| ids.contains(&e.id) && e.credentials.priority == top_priority)
                 .min_by(|a, b| match (a.last_selected_at, b.last_selected_at) {
                     (None, None) => a.id.cmp(&b.id),
                     (None, Some(_)) => std::cmp::Ordering::Less,
@@ -2920,6 +2934,62 @@ mod tests {
             );
         }
         assert_eq!(ids.len(), 3, "LRU 应让 3 个新会话铺满 3 个凭据，实际: {:?}", ids);
+    }
+
+    #[test]
+    fn session_affinity_prefers_highest_priority_tier() {
+        // 分层：cred#1 priority=0（最高层），cred#2/#3 priority=5（下层）。
+        // 多个新会话只要最高层有并发可用，就都应落到 #1，绝不下沉到 #2/#3。
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            c.priority = if i == 0 { 0 } else { 5 };
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        for i in 0..10 {
+            let key = format!("hi-{}", i);
+            let id = manager
+                .select_by_session_affinity(None, &key, &std::collections::HashSet::new(), None)
+                .unwrap()
+                .0;
+            assert_eq!(id, 1, "最高优先级层(#1)有并发可用时不应下沉到下层");
+        }
+    }
+
+    #[test]
+    fn session_affinity_cascades_to_next_tier_when_top_busy() {
+        // 分层级联：#1 priority=0，#2/#3 priority=5。
+        // 当最高层(#1)并发占满（进 busy）时，新会话应下沉到下一层(#2/#3)，
+        // 且在下层内部走 LRU 铺开。
+        let mut creds = vec![];
+        for i in 0..3 {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("token{}", i));
+            c.priority = if i == 0 { 0 } else { 5 };
+            creds.push(c);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        // #1 占满
+        let mut busy = std::collections::HashSet::new();
+        busy.insert(1u64);
+
+        let mut tier2 = std::collections::HashSet::new();
+        for i in 0..6 {
+            let key = format!("cascade-{}", i);
+            let id = manager
+                .select_by_session_affinity(None, &key, &busy, None)
+                .unwrap()
+                .0;
+            assert!(id == 2 || id == 3, "最高层全忙时应下沉到下层(#2/#3)，实际 #{}", id);
+            tier2.insert(id);
+        }
+        assert_eq!(tier2.len(), 2, "下层内部应按 LRU 铺到 #2 和 #3，实际: {:?}", tier2);
     }
 
     #[test]
