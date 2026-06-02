@@ -938,6 +938,23 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let is_opus = model_lower.contains("opus");
     let has_thinking_suffix = model_lower.contains("thinking");
 
+    // 客户端请求了 json_schema 结构化输出：不强开 thinking。
+    // 结构化输出与 thinking 互斥（隐藏工具方案要求模型只调工具不自由输出，
+    // 与 thinking 的推理流冲突），且强开 thinking 会让结构化输出模式失效。
+    // 保留 output_config 原样（含 format），让下游 converter 走结构化输出路径。
+    let wants_structured_output = payload
+        .output_config
+        .as_ref()
+        .and_then(|c| c.json_schema())
+        .is_some();
+    if wants_structured_output && payload.thinking.is_none() {
+        tracing::info!(
+            model = %payload.model,
+            "检测到 json_schema 结构化输出请求，跳过默认 thinking 注入（互斥）"
+        );
+        return;
+    }
+
     if is_opus {
         // 客户端已显式配置 thinking 则尊重之，不覆写（含 budget/类型）
         if payload.thinking.is_some() {
@@ -961,7 +978,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
         });
-        payload.output_config = Some(OutputConfig { effort });
+        payload.output_config = Some(OutputConfig { effort, format: None });
     } else if has_thinking_suffix {
         // 非 Opus 但带 -thinking 后缀：enabled + 固定 budget
         tracing::info!(
@@ -1325,6 +1342,26 @@ mod thinking_override_tests {
         let mut p = req("claude-sonnet-4-6", serde_json::json!({}));
         override_thinking_from_model_name(&mut p);
         assert!(p.thinking.is_none());
+    }
+
+    #[test]
+    fn structured_output_skips_default_thinking() {
+        // 客户端请求 json_schema 结构化输出 → 不强开 thinking（与结构化输出互斥）
+        let mut p = req(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
+                    }
+                }
+            }),
+        );
+        override_thinking_from_model_name(&mut p);
+        assert!(p.thinking.is_none(), "结构化输出请求不应被强开 thinking");
+        // output_config(含 format) 应原样保留, 供下游 converter 注入指令
+        assert!(p.output_config.and_then(|c| c.format).is_some(), "format 应保留");
     }
 
     #[test]

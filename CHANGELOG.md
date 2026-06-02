@@ -1,5 +1,49 @@
 # Changelog
 
+## [v45] - 2026-06-03
+
+### Features —— PDF 文档识别 + 结构化输出（过 hvoy.ai/cctest 检测）
+
+实测抓取 hvoy.ai 检测探针(tcpdump 抓 yapi→38990 明文 HTTP)，确诊 Opus 4.8=34% 的失分项后针对性修复。
+
+**PDF 文档识别**（之前：document 块被直接丢弃 → PDF 没传给 Kiro → 识别失败）
+- Kiro 上游**原生支持文档附件**：`documents[*]={name,format,source:{bytes}}`，与 images 并列。
+- 新增 `KiroDocument`/`KiroDocumentSource` wire 类型 + `UserInputMessage`/`UserMessage` 的 `documents` 字段。
+- converter `process_message_content` 现处理 `{type:"document",source:{type:base64,media_type,data}}` 块，
+  支持 pdf/csv/doc/docx/xls/xlsx/html/txt/md（media_type→format 映射）。base64 字节原样透传，不转图不抽文本。
+- 空内容兜底同步纳入 documents（只有文档无文本的消息不再被误判为空）。
+
+**结构化输出**（之前：`output_config.format` 完全没处理 → 返回自然语言 → 失败）
+- `OutputConfig` 扩展 `format:{type:"json_schema",schema}` + `json_schema()` 取值。
+- converter 检测到 json_schema 时，向 system 注入"只输出严格符合 schema 的 JSON、无 prose/无 markdown 围栏"指令
+  （系统指令方案，非隐藏工具——零 stream 层改动，强模型 Opus 遵从度高）。
+- **与 thinking 互斥且不损失 thinking**：handlers 层检测到 json_schema 请求时跳过 Opus 默认 thinking 注入
+  （结构化输出与 thinking 冲突，符合 Anthropic 官方约束）；普通请求 thinking 行为完全不变。
+
+### Notes & Caveats
+
+- 签名校验"部分合格"根因已确诊(protobuf f2.f1.f6=claude-quince 暴露 Bedrock 渠道)，下一版做 field6 替换。
+- 文档 URL/file 源、text 源暂不支持(本 crate 未直接依赖 base64)，仅 base64 源(检测探针与 SDK 标准用法)。
+- 7 个新单测(PDF×3、结构化输出×2、thinking互斥×1、format映射含在内)。全量 344 测试通过。
+
+## [v44] - 2026-06-02
+
+### Fixes —— 会话亲和选号未考虑优先级层级
+
+- **问题**：affinity 模式下，给**新会话**分配 primary（以及 primary 不可用时挑稳定 alt）的
+  `lru_id` 闭包是在**所有合格账号里**选"最久未调用(LRU)"，**完全无视 `priority` 层级**。
+  导致高优先级账号和低优先级账号被平等轮转，违背"优先用高优先级层、层满才下沉"的预期。
+- **期望语义**：先按层级 —— 在**最高优先级层**（`priority` 数值最小）内部做 LRU；
+  仅当最高层**并发占满（无可用并发）**时，才级联下沉到下一层。
+- **修复**：`select_by_session_affinity` 的 `lru_id` 改为**分层 LRU** —— 先取候选集合内
+  `priority` 最小值锁定最高层，再在该层内选 `last_selected_at` 最旧者。
+  级联是天然的：并发占满的账号已被 caller 滤出 `eligible_ids`/`exclude`，最高层全忙时其成员
+  离开候选集合，最小 `priority` 自动下移到下一层 —— 零额外逻辑实现"层满才下沉"。
+- **不变**：已钉住的老会话仍稳定锁原账号（缓存局部性优先，不因更高层账号空出而漂移）；
+  fallback 路径 `select_next_credential` 本就按 `priority` 选，无需改。
+- **验证**：2 个新单测（最高层有并发→恒落最高层；最高层全忙→下沉下层且层内 LRU 铺开）。
+  对抗审查（Skeptic）判 NO ISSUES。全量 338 测试通过。
+
 ## [v43] - 2026-06-02
 
 ### Fixes —— SYSTEM_CHUNKED_POLICY 条件化注入（修复第三方检测"行为验证失败"的一项污染源）

@@ -86,7 +86,7 @@ fn anthropic_message_has_cache_control(content: &serde_json::Value) -> bool {
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, CachePoint, ClientCacheConfig, ConversationState, CurrentMessage,
-    HistoryAssistantMessage, HistoryUserMessage, KiroImage, Message, UserInputMessage,
+    HistoryAssistantMessage, HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage,
     UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
@@ -454,7 +454,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, documents, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -522,13 +522,17 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 兜底：仅当 text、tool_results、images 全空时才占位（Kiro 判 400 Improperly formed request）。
-    // 注意：只在"彻底空"时兜底——"无文本但有 tool_results"是正常工具结果回合，
-    // 线上证据表明 Kiro 接受其空文本，绝不能注入占位符（否则污染每个工具回合）。
+    // 兜底：仅当 text、tool_results、images、documents 全空时才占位（Kiro 判 400 Improperly formed request）。
+    // 注意：只在"彻底空"时兜底——"无文本但有 tool_results/document"是正常回合，
+    // 线上证据表明 Kiro 接受其空文本，绝不能注入占位符（否则污染每个回合）。
     // 这种全空 user 回合极少见（通常是客户端异常）。
-    let content = if text_content.trim().is_empty() && !has_tool_results && images.is_empty() {
+    let content = if text_content.trim().is_empty()
+        && !has_tool_results
+        && images.is_empty()
+        && documents.is_empty()
+    {
         tracing::warn!(
-            "当前 user 消息为空（无 text/tool_result/image），已用占位符兜底以避免 Kiro 400"
+            "当前 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
         EMPTY_CONTENT_PLACEHOLDER.to_string()
     } else {
@@ -541,6 +545,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     if !images.is_empty() {
         user_input = user_input.with_images(images);
+    }
+
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
     }
 
     // 实验：翻译 cache_control → cachePoint。env flag 控制，默认关闭。
@@ -606,12 +614,13 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
-/// 处理消息内容，提取文本、图片和工具结果
+/// 处理消息内容，提取文本、图片、文档和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -631,6 +640,14 @@ fn process_message_content(
                             if let Some(source) = block.source {
                                 if let Some(img) = anthropic_image_to_kiro(&source) {
                                     images.push(img);
+                                }
+                            }
+                        }
+                        "document" => {
+                            // Anthropic 文档块 → Kiro documents[*]（PDF/Office/文本附件）
+                            if let Some(source) = block.source {
+                                if let Some(doc) = anthropic_document_to_kiro(block.name.as_deref(), &source) {
+                                    documents.push(doc);
                                 }
                             }
                         }
@@ -664,7 +681,51 @@ fn process_message_content(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
+/// 从文档 media_type 获取 Kiro 文档格式。
+/// Kiro 原生支持的文档类型集合（与 static_flow 对齐）。
+fn get_document_format(media_type: &str) -> Option<String> {
+    let f = match media_type {
+        "application/pdf" => "pdf",
+        "text/csv" => "csv",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/html" => "html",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        _ => return None,
+    };
+    Some(f.to_string())
+}
+
+/// 把 Anthropic 文档块的 source 转为 KiroDocument。
+///
+/// - `type:"base64"` + `data` + `media_type` → 直接透传 base64 字节
+/// - `type:"url"` / `"file"` → 暂不支持（需异步抓取），跳过
+///
+/// 注：Anthropic 文档块的 base64 是标准用法（检测平台与 SDK 均如此发送）；
+/// `text` 源文档需要 base64 编码，本 crate 未直接依赖 base64，暂不处理（跳过并记日志）。
+fn anthropic_document_to_kiro(
+    name: Option<&str>,
+    source: &super::types::ImageSource,
+) -> Option<KiroDocument> {
+    let media_type = source.media_type.as_deref()?;
+    let format = get_document_format(media_type)?;
+    let doc_name = name.filter(|n| !n.is_empty()).unwrap_or("document").to_string();
+    match source.source_type.as_str() {
+        "base64" => {
+            let data = source.data.as_ref()?;
+            Some(KiroDocument::from_base64(doc_name, format, data.clone()))
+        }
+        other => {
+            tracing::warn!(source_type = other, media_type, "暂不支持的文档源类型，已跳过");
+            None
+        }
+    }
 }
 
 /// 从 media_type 获取图片格式
@@ -914,6 +975,7 @@ fn remove_orphaned_tool_results(history: &mut [Message]) {
             if uim.content.trim().is_empty()
                 && uim.user_input_message_context.tool_results.is_empty()
                 && uim.images.is_empty()
+                && uim.documents.is_empty()
             {
                 uim.content = EMPTY_CONTENT_PLACEHOLDER.to_string();
                 repaired_empty += 1;
@@ -1032,6 +1094,22 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+/// 生成结构化输出指令（当客户端请求 json_schema 输出时）。
+///
+/// Kiro 上游无原生 response_format 字段，改用 system 指令约束模型只输出
+/// 严格符合 schema 的 JSON。强模型（Opus）遵从度高。该指令仅在 thinking
+/// 未启用时注入（与 thinking 互斥，已在 handlers 层保证）。
+fn structured_output_instruction(req: &MessagesRequest) -> Option<String> {
+    let schema = req.output_config.as_ref()?.json_schema()?;
+    let schema_str = serde_json::to_string(schema).ok()?;
+    Some(format!(
+        "You must respond with ONLY a single JSON value that strictly conforms to this JSON Schema. \
+         Do not include any explanatory text, markdown code fences, or prose before or after the JSON. \
+         Output the raw JSON object only.\n\nJSON Schema:\n{}",
+        schema_str
+    ))
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1045,46 +1123,63 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+    // 结构化输出指令（客户端请求 json_schema 时；与 thinking 互斥）
+    let structured_instruction = structured_output_instruction(req);
 
     // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| strip_rolling_fingerprints(&s.text))
-            .collect::<Vec<_>>()
-            .join("\n");
+    // 先归一化出客户端系统提示文本（无 system 或空 system 都视为空串）。
+    // 注意：deserialize_system 会把 `"system":""` 解析成 Some([""]), 故这里统一用
+    // is_empty 判断，避免"空 system 但有 thinking/结构化指令"时整块被跳过（漏注入）。
+    let client_system = req
+        .system
+        .as_ref()
+        .map(|system| {
+            system
+                .iter()
+                .map(|s| strip_rolling_fingerprints(&s.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
 
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息——仅当请求里确实带了 Write/Edit 工具时才注入。
-            // 该策略文案本身就是约束 Write/Edit 的分块行为，对不含这两个工具的"干净"
-            // 客户端（如第三方检测、纯对话）注入会污染行为，被行为验证类检测识别。
-            let system_content = if request_has_chunked_tools(req) {
-                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+    // 仅当有真实系统提示、或需要注入 thinking 前缀 / 结构化输出指令时，才构建系统消息块。
+    if !client_system.is_empty()
+        || thinking_prefix.is_some()
+        || structured_instruction.is_some()
+    {
+        // 追加分块写入策略——仅当请求里确实带了 Write/Edit 工具、且有真实系统提示时才注入。
+        // 该策略文案约束 Write/Edit 分块行为，对干净客户端注入会污染行为被检测识别。
+        let mut system_content = client_system;
+        if !system_content.is_empty() && request_has_chunked_tools(req) {
+            system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+        }
+
+        // 追加结构化输出指令（如有）
+        if let Some(ref instr) = structured_instruction {
+            system_content = if system_content.is_empty() {
+                instr.clone()
             } else {
-                system_content
+                format!("{}\n\n{}", system_content, instr)
             };
+        }
 
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
+        // 注入thinking标签到系统消息最前面（如果需要且不存在）
+        let final_content = if let Some(ref prefix) = thinking_prefix {
+            if !has_thinking_tags(&system_content) {
+                if system_content.is_empty() {
+                    prefix.clone()
                 } else {
-                    system_content
+                    format!("{}\n{}", prefix, system_content)
                 }
             } else {
                 system_content
-            };
+            }
+        } else {
+            system_content
+        };
 
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
-        }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+        // 系统消息作为 user + assistant 配对
+        let user_msg = HistoryUserMessage::new(final_content, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -1149,27 +1244,30 @@ fn merge_user_messages(
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
+    let mut all_documents = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
         all_images.extend(images);
+        all_documents.extend(documents);
         all_tool_results.extend(tool_results);
     }
 
     let content = content_parts.join("\n");
-    // 兜底：text + tool_results + images 全空时，Kiro 会判 400 Improperly formed request。
-    // 注意只在"彻底空"时兜底——"无文本但有 tool_results"是正常的工具结果回合，
-    // Kiro 接受其空文本，不能注入占位符（否则污染每个工具回合）。
+    // 兜底：text + tool_results + images + documents 全空时，Kiro 会判 400 Improperly formed request。
+    // 注意只在"彻底空"时兜底——"无文本但有 tool_results/document"是正常回合，
+    // Kiro 接受其空文本，不能注入占位符（否则污染每个回合）。
     let content = if content.trim().is_empty()
         && all_tool_results.is_empty()
         && all_images.is_empty()
+        && all_documents.is_empty()
     {
         tracing::warn!(
-            "历史 user 消息为空（无 text/tool_result/image），已用占位符兜底以避免 Kiro 400"
+            "历史 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
         EMPTY_CONTENT_PLACEHOLDER.to_string()
     } else {
@@ -1179,6 +1277,10 @@ fn merge_user_messages(
 
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
+    }
+
+    if !all_documents.is_empty() {
+        user_msg = user_msg.with_documents(all_documents);
     }
 
     if !all_tool_results.is_empty() {
@@ -1800,6 +1902,158 @@ mod tests {
         assert!(
             !first_history_user_text(&result).contains("comply silently"),
             "仅含非 Write/Edit 工具时不应注入分块策略"
+        );
+    }
+
+    #[test]
+    fn test_pdf_document_block_maps_to_kiro_documents() {
+        // hvoy PDF 探针: messages[0].content 含 document(application/pdf base64) + text
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="}},
+                    {"type": "text", "text": "What text does this PDF contain?"}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let docs = &result.conversation_state.current_message.user_input_message.documents;
+        assert_eq!(docs.len(), 1, "PDF document 块应转成 1 个 KiroDocument");
+        assert_eq!(docs[0].format, "pdf");
+        assert_eq!(docs[0].source.bytes, "JVBERi0xLjQ=");
+        // 文本仍保留
+        let content = &result.conversation_state.current_message.user_input_message.content;
+        assert!(content.contains("What text does this PDF"));
+    }
+
+    #[test]
+    fn test_document_format_mapping() {
+        assert_eq!(get_document_format("application/pdf").as_deref(), Some("pdf"));
+        assert_eq!(get_document_format("text/csv").as_deref(), Some("csv"));
+        assert_eq!(
+            get_document_format("application/vnd.openxmlformats-officedocument.wordprocessingml.document").as_deref(),
+            Some("docx")
+        );
+        assert_eq!(get_document_format("image/png"), None, "图片类型不应被当文档");
+    }
+
+    #[test]
+    fn test_document_only_message_not_placeholdered() {
+        // 只有 document、无文本的 user 消息不应被当成"空"而注入占位符
+        let src = super::super::types::ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some("application/pdf".to_string()),
+            data: Some("JVBERi0xLjQ=".to_string()),
+            url: None,
+            file_id: None,
+        };
+        let doc = anthropic_document_to_kiro(Some("report"), &src);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.name, "report");
+        assert_eq!(doc.format, "pdf");
+    }
+
+    #[test]
+    fn test_structured_output_injects_schema_instruction() {
+        // hvoy 结构化输出探针: output_config.format=json_schema, 无 thinking
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("计算 39 乘以 63"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "high".to_string(),
+                format: Some(super::super::types::OutputFormat {
+                    format_type: "json_schema".to_string(),
+                    schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}, "result": {"type": "integer"}},
+                        "required": ["expression", "result"],
+                        "additionalProperties": false
+                    })),
+                }),
+            }),
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let sys = first_history_user_text(&result);
+        assert!(sys.contains("strictly conforms to this JSON Schema"), "应注入结构化输出指令");
+        assert!(sys.contains("\"expression\""), "指令应含 schema 内容");
+        // 无系统消息时也应建出系统消息承载指令
+        assert!(sys.contains("Output the raw JSON object only"));
+    }
+
+    #[test]
+    fn test_structured_output_instruction_absent_without_schema() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: true,
+            system: Some(vec![super::super::types::SystemMessage { text: "You are helpful.".to_string() }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(!first_history_user_text(&result).contains("JSON Schema"), "无 schema 不应注入");
+    }
+
+    #[test]
+    fn test_structured_output_with_empty_system_still_injects() {
+        // 回归(对抗审查发现): system="" 时, 结构化指令不应被漏掉
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("计算 1+1"),
+            }],
+            stream: true,
+            system: Some(vec![super::super::types::SystemMessage { text: "".to_string() }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "high".to_string(),
+                format: Some(super::super::types::OutputFormat {
+                    format_type: "json_schema".to_string(),
+                    schema: Some(serde_json::json!({"type": "object", "properties": {"r": {"type": "integer"}}})),
+                }),
+            }),
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(
+            first_history_user_text(&result).contains("strictly conforms to this JSON Schema"),
+            "空 system 时结构化指令仍应注入"
         );
     }
 

@@ -98,6 +98,29 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// 结构化输出格式（`{type:"json_schema", schema:{...}}`）。
+    /// 客户端要求模型输出严格符合 schema 的 JSON 时携带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<OutputFormat>,
+}
+
+/// 结构化输出格式描述
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+}
+
+impl OutputConfig {
+    /// 若配置了 json_schema 结构化输出，返回其 schema。
+    pub fn json_schema(&self) -> Option<&serde_json::Value> {
+        self.format
+            .as_ref()
+            .filter(|f| f.format_type == "json_schema")
+            .and_then(|f| f.schema.as_ref())
+    }
 }
 
 fn default_effort() -> String {
