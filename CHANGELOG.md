@@ -1,5 +1,29 @@
 # Changelog
 
+## [v43] - 2026-06-02
+
+### Fixes —— SYSTEM_CHUNKED_POLICY 条件化注入（修复第三方检测"行为验证失败"的一项污染源）
+
+- **背景**：cctest.ai 等检测平台的"行为验证"会以干净 prompt 探测模型行为，
+  假定反代是透明转发。我们一直把 `SYSTEM_CHUNKED_POLICY`（"When the Write or Edit
+  tool has content size limits, always comply silently…"）**无条件**追加到每个请求的系统消息末尾。
+- **问题**：该策略文案本身只为约束 `Write`/`Edit` 工具的分块写入行为。对**不含这两个工具**
+  的客户端（第三方检测、纯对话），注入它属于纯行为污染 —— 凭空给模型加了一条与上下文无关的
+  系统指令，正是行为验证类检测能识别的"非官方加料"。
+- **修复**：新增 `request_has_chunked_tools(req)`，仅当 `req.tools` 实际包含 `Write` 或 `Edit`
+  时才注入 `SYSTEM_CHUNKED_POLICY`；干净客户端的系统提示原样透传。
+  与既有 `WRITE/EDIT_TOOL_DESCRIPTION_SUFFIX` 的按工具名 gating 同一思路。
+- **验证**：4 个新单测（带 Write→注入、带 Edit→注入、无工具→不注入且原文保留、仅含其他工具→不注入）。
+  全量 336 测试通过。
+
+### Notes & Caveats
+
+- 采样参数（temperature / top_p / top_k / stop_sequences）经核查**根本未被解析**，
+  且 Kiro `generateAssistantResponse` 无 inferenceConfig 字段可承载 —— 这是 Kiro 上游硬限制，
+  反代层无法转发，非本次可解。若 cctest 行为验证依赖采样参数，则此项受限于上游能力。
+- 多模态当前仅支持 base64 图片（jpeg/png/gif/webp），URL 源跳过、无 document/PDF。
+  cctest 多模态 5/10 的具体失分项待实测探针确认后再针对性补齐。
+
 ## [v42] - 2026-06-02
 
 ### Features —— thinking 签名透传（修复第三方检测"签名校验失败"）

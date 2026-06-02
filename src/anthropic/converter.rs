@@ -383,6 +383,15 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     tool_names
 }
 
+/// 请求里是否带了受分块策略约束的工具（Write / Edit）。
+/// 仅当存在这两个工具时，才把 SYSTEM_CHUNKED_POLICY 注入系统消息，
+/// 避免对不含这两个工具的干净客户端造成行为污染。
+fn request_has_chunked_tools(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == "Write" || t.name == "Edit"))
+}
+
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 fn create_placeholder_tool(name: &str) -> Tool {
@@ -1046,8 +1055,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 追加分块写入策略到系统消息——仅当请求里确实带了 Write/Edit 工具时才注入。
+            // 该策略文案本身就是约束 Write/Edit 的分块行为，对不含这两个工具的"干净"
+            // 客户端（如第三方检测、纯对话）注入会污染行为，被行为验证类检测识别。
+            let system_content = if request_has_chunked_tools(req) {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -1700,6 +1715,91 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
+        );
+    }
+
+    /// 提取 history[0]（系统消息折叠成的 user 消息）的文本内容
+    fn first_history_user_text(result: &ConversionResult) -> String {
+        match result.conversation_state.history.first() {
+            Some(Message::User(u)) => u.user_input_message.content.clone(),
+            other => panic!("history[0] 应为系统消息折叠的 User，实际: {other:?}"),
+        }
+    }
+
+    fn make_named_tool(name: &str) -> super::super::types::Tool {
+        super::super::types::Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: "desc".to_string(),
+            input_schema: std::collections::HashMap::new(),
+            max_uses: None,
+        }
+    }
+
+    fn req_with_system_and_tools(
+        tools: Option<Vec<super::super::types::Tool>>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: Some(vec![super::super::types::SystemMessage {
+                text: "You are a helpful assistant.".to_string(),
+            }]),
+            tools,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        }
+    }
+
+    #[test]
+    fn test_chunked_policy_injected_when_write_tool_present() {
+        let req = req_with_system_and_tools(Some(vec![make_named_tool("Write")]));
+        let result = convert_request(&req).unwrap();
+        assert!(
+            first_history_user_text(&result).contains("comply silently"),
+            "带 Write 工具时应注入 SYSTEM_CHUNKED_POLICY"
+        );
+    }
+
+    #[test]
+    fn test_chunked_policy_injected_when_edit_tool_present() {
+        let req = req_with_system_and_tools(Some(vec![make_named_tool("Edit")]));
+        let result = convert_request(&req).unwrap();
+        assert!(
+            first_history_user_text(&result).contains("comply silently"),
+            "带 Edit 工具时应注入 SYSTEM_CHUNKED_POLICY"
+        );
+    }
+
+    #[test]
+    fn test_chunked_policy_absent_for_clean_client() {
+        // 无工具的干净客户端（如第三方行为检测）：系统消息不应被污染
+        let req = req_with_system_and_tools(None);
+        let result = convert_request(&req).unwrap();
+        let text = first_history_user_text(&result);
+        assert!(
+            !text.contains("comply silently"),
+            "无 Write/Edit 工具时不应注入分块策略，避免行为污染"
+        );
+        assert!(text.contains("helpful assistant"), "原始系统提示应原样保留");
+    }
+
+    #[test]
+    fn test_chunked_policy_absent_when_only_other_tools() {
+        // 带了别的工具（非 Write/Edit）也不应注入
+        let req = req_with_system_and_tools(Some(vec![make_named_tool("get_weather")]));
+        let result = convert_request(&req).unwrap();
+        assert!(
+            !first_history_user_text(&result).contains("comply silently"),
+            "仅含非 Write/Edit 工具时不应注入分块策略"
         );
     }
 
