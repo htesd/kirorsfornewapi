@@ -996,6 +996,10 @@ fn remove_orphaned_tool_results(history: &mut [Message]) {
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
+/// 工具描述最大长度（字符）。超长描述安全截断，避免上游因超大 schema 报错。
+/// 命名常量而非散落魔法数；converter 为无状态自由函数，不引入 config 穿透。
+const TOOL_DESCRIPTION_MAX_LEN: usize = 10000;
+
 /// 空内容占位符。Kiro API 要求 message 的 content 字段非空，否则返回
 /// 400 "Improperly formed request"。当 assistant/user 消息没有任何可见文本时
 /// （纯 tool_use 回合，或上游空响应残留），用单个空格兜底保持 schema 合法。
@@ -1049,8 +1053,8 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 description.push_str(suffix);
             }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
+            // 限制描述长度（安全截断 UTF-8，单次遍历）
+            let description = match description.char_indices().nth(TOOL_DESCRIPTION_MAX_LEN) {
                 Some((idx, _)) => description[..idx].to_string(),
                 None => description,
             };
@@ -1299,6 +1303,8 @@ fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
+    // 注意：本函数仅用于**历史** assistant 消息（build_history 调用），不触及当前轮。
+    // 历史里的 thinking 被刻意丢弃 —— 见下方 final_content 处的说明（缓存稳定性）。
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
@@ -1336,29 +1342,34 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if !text_content.is_empty() {
+    // 历史 assistant 内容构建 —— **刻意不拼接 thinking 块**。
+    //
+    // 根因（v49 修复）：Claude Code 等客户端会做 thinking 滚动裁剪——只在请求历史里
+    // 保留最近几轮的 `<thinking>`，更早的 assistant 消息其 thinking 被移除。若我们原样
+    // 透传，则同一条历史 assistant 消息会随对话推进从"带 thinking"变成"不带"，**内容
+    // 跨轮抖动 → 打断 Kiro prefix cache → 该点之后全部缓存失效**。实测某 thinking 会话
+    // 命中率因此被打到 0.24–0.36（健康会话 0.78）。
+    //
+    // 既然客户端本就在裁剪历史 thinking，我们干脆**统一丢弃所有历史 thinking**，让历史
+    // 前缀跨轮恒定，缓存稳定。这只影响发给 Kiro 的"历史推理文本"（客户端已在裁），
+    // **不影响当前轮的 thinking 能力**（当前轮不经本函数；响应侧 thinking_delta/签名照常）。
+    //
+    // 格式：仅 `text内容`（含 tool_use 时正文可空，用占位符）。thinking_content 仅用于
+    // 下方的"是否曾有内容"判断，不进最终文本。
+    let _ = &thinking_content; // 明示：thinking 已被刻意丢弃，不参与 final_content
+    let final_content = if !text_content.is_empty() {
         text_content
     } else {
-        // text 和 thinking 均为空。
+        // text 为空（thinking 已丢弃，不再作为兜底内容）。
         // - 有 tool_use：正常的"纯工具调用"回合，用空格占位（Kiro 要求 content 非空）。
-        // - 无 tool_use：这是一条彻底空的 assistant 消息，几乎都是上游空响应/断流后
-        //   被客户端写回历史的残留。Kiro 对空 content 返回 400 Improperly formed request，
-        //   且该消息会一直留在历史里，导致整个会话每一轮都确定性失败。必须兜底为非空并告警。
+        // - 无 tool_use：彻底空的 assistant 消息，几乎都是上游空响应/断流后被客户端写回
+        //   历史的残留。Kiro 对空 content 返回 400 Improperly formed request，且该消息会
+        //   一直留在历史里导致整个会话每轮确定性失败。必须兜底为非空并告警。
+        //   注意：原先 thinking-only 的历史消息（有 thinking 无 text 无 tool_use）此处也会
+        //   落到占位符——这正是我们要的（thinking 不进历史），且这类消息极罕见。
         if tool_uses.is_empty() {
             tracing::warn!(
-                "历史中检测到空 assistant 消息（无 text/thinking/tool_use），疑似上游空响应残留，已用占位符兜底以避免 Kiro 400 毒化会话"
+                "历史中检测到空 assistant 消息（无 text/tool_use；thinking 已按缓存稳定策略丢弃），已用占位符兜底以避免 Kiro 400 毒化会话"
             );
         }
         EMPTY_CONTENT_PLACEHOLDER.to_string()
@@ -2330,6 +2341,38 @@ mod tests {
     }
 
     #[test]
+    fn test_history_assistant_strips_thinking_for_cache_stability() {
+        // v49 回归：历史 assistant 的 thinking 必须被剥离，使前缀跨轮稳定（不被客户端
+        // thinking 滚动裁剪打断 Kiro 缓存）。当前轮 thinking 能力不受影响（不经本函数）。
+        let mut m = HashMap::new();
+        // thinking + text → 只留 text
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "私密推理不该进历史"},
+                {"type": "text", "text": "最终答案"}
+            ]),
+        };
+        let c = convert_assistant_message(&msg, &mut m).unwrap();
+        let content = c.assistant_response_message.content;
+        assert_eq!(content, "最终答案", "应只保留正文，thinking 被剥离");
+        assert!(!content.contains("<thinking>"));
+        assert!(!content.contains("私密推理"));
+
+        // thinking-only（无 text 无 tool_use）→ 占位符（不把 thinking 当兜底内容）
+        let msg2 = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "只有思考没有答案"}
+            ]),
+        };
+        let c2 = convert_assistant_message(&msg2, &mut m).unwrap();
+        let content2 = c2.assistant_response_message.content;
+        assert!(!content2.contains("只有思考"), "thinking-only 不应进历史内容");
+        assert!(!content2.is_empty(), "应兜底为非空占位符避免 Kiro 400");
+    }
+
+    #[test]
     fn test_merge_user_messages_empty_gets_placeholder() {
         // 历史 user 消息彻底为空（无 text/tool_result/image）→ 必须兜底为非空
         let empty = super::super::types::Message {
@@ -2714,12 +2757,71 @@ mod tests {
         let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        // v49：历史 thinking 被刻意丢弃（缓存稳定性），故合并后**不应**含 thinking 标签
+        assert!(!content.contains("<thinking>"), "历史 thinking 应被剥离，不含标签");
+        assert!(!content.contains("Let me think about this"), "历史 thinking 文本应被剥离");
+        assert!(!content.contains("I should read the file"), "历史 thinking 文本应被剥离");
+        assert!(content.contains("Let me read that file"), "应保留第二条消息的 text 内容");
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_convert_request_strips_history_thinking_keeps_current_turn() {
+        // v49 集成回归：完整 convert_request 路径下，
+        //   1) 历史 assistant 的 thinking 文本不出现在发给 Kiro 的 history
+        //   2) 当前轮（最后一条 user）内容不受影响
+        //   3) 开启 thinking 时 system 仍注入 thinking 前缀（当前轮能力不受损）
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+        let req = MessagesRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("第一问"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "历史私密推理ABC"},
+                        {"type": "text", "text": "历史答案DEF"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("当前轮提问GHI"),
+                },
+            ],
+            system: None,
+            stream: true,
+            tools: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 2000,
+            }),
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let cs = result.conversation_state;
+        let history_json = serde_json::to_string(&cs.history).unwrap();
+        // 1) 历史 thinking 文本被剥离
+        assert!(!history_json.contains("历史私密推理ABC"), "历史 thinking 不应进 Kiro 请求");
+        assert!(!history_json.contains("<thinking>"), "历史不应含 thinking 标签");
+        // 历史正文保留
+        assert!(history_json.contains("历史答案DEF"), "历史正文应保留");
+        // 2) 当前轮内容完好
+        assert_eq!(
+            cs.current_message.user_input_message.content, "当前轮提问GHI",
+            "当前轮内容不受影响"
+        );
+        // 3) thinking 开启 → system（history 首条 user）含 thinking 前缀
+        assert!(history_json.contains("thinking"), "开启 thinking 时应注入前缀（当前轮能力保留）");
     }
 
     #[test]
