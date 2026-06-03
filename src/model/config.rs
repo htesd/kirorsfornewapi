@@ -113,12 +113,9 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 用户感知的缓存命中比例（可选，0.0-1.0；默认 None = 不放大，按实际/估算上报）
-    ///
-    /// 当一个请求被判定为命中且此值已配置时，会把 `cache_read_input_tokens`
-    /// 上报为 `max(实际命中, prompt_tokens × 此比例)`（夹到 prompt_tokens 上限）。
-    /// 用于在中转网关（NewAPI 等）一端把账单显示得更便宜，吸引用户。代理方承担
-    /// 与 Kiro 真实计费的差额。常用 0.92（即 92% 输入按缓存价计费）。
+    /// **v53 起废弃**：旧的"感知缓存命中放大比例"。计费已统一走模拟器 +
+    /// config.cache 的 readMultiplier/capRatio/floorRatio 三参数。
+    /// 保留此字段仅为兼容旧 config.json（反序列化不报错），**不再被读取**。
     #[serde(default)]
     pub perceived_cache_hit_ratio: Option<f64>,
 

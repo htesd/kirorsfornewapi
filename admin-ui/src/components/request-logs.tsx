@@ -19,7 +19,7 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`
 }
 
-// 缓存命中展示：上排=真实估算（DB cachedTokens），下排=实际发给 NewAPI 的值（cacheReadReported，受 perceived_cache_hit_ratio 放大）
+// 缓存命中展示：上排=模拟器命中（DB cachedTokens），下排=实际发给 NewAPI 的值（cacheReadReported，= clamp(命中×倍率, total×floor, total×cap)）
 function cacheCell(cachedTokens?: number, reported?: number) {
   const truthEl =
     cachedTokens == null

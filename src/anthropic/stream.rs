@@ -578,17 +578,17 @@ pub struct StreamContext {
     pub cache_creation_input_tokens: Option<i32>,
     /// Kiro meteringEvent.usage（cache_estimate 回退需要）
     pub metering_usage: Option<f64>,
-    /// 用户感知缓存命中放大比例（None = 不放大）
-    pub perceived_cache_hit_ratio: Option<f64>,
-    /// 缓存上报锚定放大倍率（来自 config.cache.readMultiplier，运行时可热调）
+    /// 缓存上报缩放倍率（来自 config.cache.readMultiplier，运行时可热调）
     pub cache_read_multiplier: f64,
-    /// metering 反推命中阈值（来自 config.cache.hitThreshold；末级估算兜底用）
-    pub cache_hit_threshold: f64,
-    /// prefix 缓存模拟器算出的 cache_read（上游不下发真值时的兜底；None = 未模拟）
-    pub sim_cache_read: Option<i32>,
+    /// 命中上限比率（config.cache.capRatio）：上报封顶 = total × 此值
+    pub cache_cap_ratio: f64,
+    /// 最低比率（config.cache.floorRatio）：上报下限 = total × 此值
+    pub cache_floor_ratio: f64,
+    /// prefix 缓存模拟器算出的 (命中 token, 本轮总 token)；同口径，供 billing 算比例。None = 未模拟。
+    pub sim_cache: Option<(i32, i32)>,
     /// 流结束时实际 emit 给 NewAPI 的 cache_read（generate_final_events 设置）
     pub emitted_cache_read: Option<i32>,
-    /// 流结束时选中的"真实值"cache_read（三层优先级择一；写入 DB cached_tokens）
+    /// 流结束时模拟器命中的真实值（写入 DB cached_tokens，供缓存分析）
     pub emitted_raw_cache_read: Option<i32>,
     pub emitted_cache_creation: Option<i32>,
     /// 原生 reasoningContentEvent 的 thinking 块是否已开启（未关闭）
@@ -673,10 +673,10 @@ impl StreamContext {
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
             metering_usage: None,
-            perceived_cache_hit_ratio: None,
             cache_read_multiplier: super::usage::DEFAULT_CACHE_READ_MULTIPLIER,
-            cache_hit_threshold: crate::kiro::cache_estimate::DEFAULT_HIT_THRESHOLD,
-            sim_cache_read: None,
+            cache_cap_ratio: super::usage::DEFAULT_CACHE_CAP_RATIO,
+            cache_floor_ratio: super::usage::DEFAULT_CACHE_FLOOR_RATIO,
+            sim_cache: None,
             emitted_cache_read: None,
             emitted_raw_cache_read: None,
             emitted_cache_creation: None,
@@ -688,24 +688,24 @@ impl StreamContext {
         }
     }
 
-    /// 设置感知缓存命中放大比例
-    pub fn set_perceived_cache_hit_ratio(&mut self, r: Option<f64>) {
-        self.perceived_cache_hit_ratio = r;
-    }
-
-    /// 设置缓存上报放大倍率（来自 config.cache.readMultiplier 的 live 值）
+    /// 设置缓存上报缩放倍率（来自 config.cache.readMultiplier 的 live 值）
     pub fn set_cache_read_multiplier(&mut self, m: f64) {
         self.cache_read_multiplier = m;
     }
 
-    /// 设置 metering 命中阈值（来自 config.cache.hitThreshold 的 live 值）
-    pub fn set_cache_hit_threshold(&mut self, t: f64) {
-        self.cache_hit_threshold = t;
+    /// 设置命中上限比率（config.cache.capRatio 的 live 值）
+    pub fn set_cache_cap_ratio(&mut self, r: f64) {
+        self.cache_cap_ratio = r;
     }
 
-    /// 设置 prefix 缓存模拟器算出的 cache_read（上游不下发真值时的兜底）
-    pub fn set_sim_cache_read(&mut self, v: Option<i32>) {
-        self.sim_cache_read = v;
+    /// 设置最低比率（config.cache.floorRatio 的 live 值）
+    pub fn set_cache_floor_ratio(&mut self, r: f64) {
+        self.cache_floor_ratio = r;
+    }
+
+    /// 设置 prefix 缓存模拟器结果 (命中 token, 本轮总 token)（计费上报来源）
+    pub fn set_sim_cache(&mut self, v: Option<(i32, i32)>) {
+        self.sim_cache = v;
     }
 
     /// 生成 message_start 事件
@@ -1477,60 +1477,35 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
-        // 零输出保护：若本轮最终无任何输出 token（completion=0），即便上游/模拟给了
-        // cache_read，也**不向客户端计费缓存**——用户没拿到任何产出，不该为缓存读付费。
-        // 正常空响应已在上方判 EmptyResponse 提前 return；这里兜住"绕过空检测但输出为 0"
-        // 的边界（如 produced_any_content()=true 但 output_tokens 仍为 0 的畸形响应）。
-        // 注意：仍按真实值落库 cached_tokens（供缓存分析），只把**上报值**归零。
+        // 零输出保护：若本轮最终无任何输出 token（completion=0），即便模拟器给了命中，
+        // 也**不向客户端计费缓存**——用户没拿到任何产出，不该为缓存读付费。
+        // 正常空响应已在上方判 EmptyResponse 提前 return；这里兜住"绕过空检测但输出为 0"。
         let zero_output = self.output_tokens <= 0;
 
-        // 决定 cache_read 的"真实值"（三层优先级，与非流式路径一致）：
-        //   1. Kiro tokenUsageEvent 真值（最准） 2. prefix 缓存模拟器 3. metering 反推 4. 0
-        let (raw_cache_read, _src) = if let Some(real) = self.cache_read_input_tokens {
-            (real, "upstream")
-        } else if let Some(sim) = self.sim_cache_read.filter(|v| *v > 0) {
-            (sim, "sim")
-        } else {
-            let est = self
-                .metering_usage
-                .and_then(|m| {
-                    crate::kiro::cache_estimate::estimate_with_threshold(
-                        &self.model,
-                        final_input_tokens,
-                        self.output_tokens,
-                        m,
-                        self.cache_hit_threshold,
-                    )
-                })
-                .map(|e| e.cache_read_tokens)
-                .unwrap_or(0);
-            (est, "estimate")
-        };
-        // 记下选中的真实值，供 SSE 外层写入 cached_tokens（真实命中，供缓存优化分析）。
-        // 只要任一层给出结论（上游真值 / sim 已跑 / 估算命中）就记，使 finish 的
-        // apply_cache_estimate 跳过，避免末级估算覆盖本处决策、造成 DB 依据不一致。
-        if raw_cache_read > 0
-            || self.cache_read_input_tokens.is_some()
-            || self.sim_cache_read.is_some()
-        {
-            self.emitted_raw_cache_read = Some(raw_cache_read);
+        // 缓存计费（v53：统一走 prefix 模拟器）。
+        //   hit/sim_total 同口径（模拟器 tokenizer）算命中比例；
+        //   report_total = Kiro contextUsageEvent 权威 token（final_input_tokens），billing 基准。
+        let (hit_tokens, sim_total) = self.sim_cache.unwrap_or((0, 0));
+        let hit_tokens = hit_tokens.max(0);
+        // 落库模拟器命中（供缓存分析）；sim 已跑（Some）就记，包括 0=明确未命中。
+        if self.sim_cache.is_some() {
+            self.emitted_raw_cache_read = Some(hit_tokens);
         }
-        // 零输出 → 上报缓存归零（计费保护）；否则按锚定放大上报。
+        // 零输出 → 上报缓存归零（计费保护）；否则按公式算上报。
         let cache_read = if zero_output {
             0
         } else {
-            super::usage::inflate_cache_read(
+            super::usage::reported_cache_read(
                 final_input_tokens,
-                raw_cache_read,
-                self.perceived_cache_hit_ratio,
+                hit_tokens,
+                sim_total,
                 self.cache_read_multiplier,
+                self.cache_cap_ratio,
+                self.cache_floor_ratio,
             )
         };
-        let cache_creation = if zero_output {
-            0
-        } else {
-            self.cache_creation_input_tokens.unwrap_or(0).max(0)
-        };
+        // 统一模型下不单列 cache_creation。
+        let cache_creation = 0;
 
         // 暴露给 SSE 流外层（写 DB 用），区分真实估算 vs 放大后实报
         self.emitted_cache_read = Some(cache_read);
@@ -1586,19 +1561,24 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 设置感知缓存命中放大比例（透传到内部 StreamContext）
-    pub fn set_perceived_cache_hit_ratio(&mut self, r: Option<f64>) {
-        self.inner.set_perceived_cache_hit_ratio(r);
-    }
-
-    /// 设置缓存上报放大倍率（透传到内部 StreamContext）
+    /// 设置缓存上报缩放倍率（透传到内部 StreamContext）
     pub fn set_cache_read_multiplier(&mut self, m: f64) {
         self.inner.set_cache_read_multiplier(m);
     }
 
-    /// 设置 metering 命中阈值（透传到内部 StreamContext）
-    pub fn set_cache_hit_threshold(&mut self, t: f64) {
-        self.inner.set_cache_hit_threshold(t);
+    /// 设置命中上限比率（透传到内部 StreamContext）
+    pub fn set_cache_cap_ratio(&mut self, r: f64) {
+        self.inner.set_cache_cap_ratio(r);
+    }
+
+    /// 设置最低比率（透传到内部 StreamContext）
+    pub fn set_cache_floor_ratio(&mut self, r: f64) {
+        self.inner.set_cache_floor_ratio(r);
+    }
+
+    /// 设置 prefix 缓存模拟器结果（透传到内部 StreamContext）
+    pub fn set_sim_cache(&mut self, v: Option<(i32, i32)>) {
+        self.inner.set_sim_cache(v);
     }
 
     /// 标记流的终态失败（透传到内部 StreamContext）。
@@ -2380,12 +2360,13 @@ mod tests {
 
     #[test]
     fn test_zero_output_does_not_bill_cache_read() {
-        // v50 计费保护：上游给了真实 cache_read，但本轮零输出（completion=0）→
+        // v50 计费保护：模拟器给了命中，但本轮零输出（completion=0）→
         // message_delta.usage 不应计费 cache_read（用户没拿到产出不该为缓存付费）。
         // 用 tool_use 让 produced_any_content()=true（绕过空响应失败判定），但保持 output=0。
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1000, false, HashMap::new());
-        ctx.set_perceived_cache_hit_ratio(Some(0.85));
-        ctx.cache_read_input_tokens = Some(5000); // 上游真值
+        ctx.set_cache_read_multiplier(1.8);
+        ctx.set_cache_cap_ratio(0.9);
+        ctx.set_sim_cache(Some((5000, 10000))); // 模拟器命中 5000/总 10000
         ctx.input_tokens = 10000;
         ctx.context_input_tokens = Some(10000);
         // 强制零输出但有内容标记（模拟畸形：有 tool block 记录但 output_tokens=0）
@@ -2405,23 +2386,24 @@ mod tests {
         }
         // emitted_cache_read 应为 0
         assert_eq!(ctx.emitted_cache_read, Some(0), "零输出上报缓存应为 0");
-        // 但真实值仍落库（emitted_raw_cache_read 保留 5000，供分析）
-        assert_eq!(ctx.emitted_raw_cache_read, Some(5000), "真实值仍记录供缓存分析");
+        // 但模拟器命中仍落库（emitted_raw_cache_read 保留 5000，供分析）
+        assert_eq!(ctx.emitted_raw_cache_read, Some(5000), "命中真值仍记录供缓存分析");
     }
 
     #[test]
     fn test_nonzero_output_bills_cache_read_normally() {
-        // 对照：有输出时正常按锚定放大计费
+        // 对照：有输出时正常按公式计费 reported = clamp(hit×mult, total×floor, total×cap)
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1000, false, HashMap::new());
-        ctx.set_perceived_cache_hit_ratio(Some(0.85));
-        ctx.cache_read_input_tokens = Some(5000);
+        ctx.set_cache_read_multiplier(1.8);
+        ctx.set_cache_cap_ratio(0.9);
+        ctx.set_sim_cache(Some((4000, 10000)));
         ctx.input_tokens = 10000;
         ctx.context_input_tokens = Some(10000);
         let _ = ctx.generate_initial_events();
         let _ = ctx.process_assistant_response("Hello world");
         let _ = ctx.generate_final_events();
-        // 有输出 → cache_read 按 5000×1.3=6500（< cap 8500）上报
-        assert_eq!(ctx.emitted_cache_read, Some(6500), "有输出应正常计费 cache_read");
+        // hit=4000, ×1.8=7200 < cap(0.9×10000=9000) → 7200
+        assert_eq!(ctx.emitted_cache_read, Some(7200), "有输出应正常计费 cache_read");
     }
 
     #[test]

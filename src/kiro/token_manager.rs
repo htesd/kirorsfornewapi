@@ -564,13 +564,13 @@ pub struct MultiTokenManager {
     affinity_promote_threshold: AtomicU32,
     /// 会话亲和映射 TTL（秒，运行时可调）
     affinity_map_ttl_secs: AtomicU64,
-    /// 用户感知缓存命中放大比例（None=不放大；运行时可调，作用于响应 usage 上报）
-    perceived_cache_hit_ratio: Mutex<Option<f64>>,
-    /// 缓存上报锚定放大倍率（运行时可调，config.cache.readMultiplier）。
+    /// 缓存上报缩放倍率（运行时可调，config.cache.readMultiplier）。
     /// 用 AtomicU64 存 f64 bits（无原子 f64），读写经 from_bits/to_bits。
     cache_read_multiplier_bits: AtomicU64,
-    /// metering 反推命中判定阈值（运行时可调，config.cache.hitThreshold）。同上以 bits 存。
-    cache_hit_threshold_bits: AtomicU64,
+    /// 命中上限比率（运行时可调，config.cache.capRatio）：上报封顶 = total × 此值。bits 存。
+    cache_cap_ratio_bits: AtomicU64,
+    /// 最低比率（运行时可调，config.cache.floorRatio）：上报下限 = total × 此值。bits 存。
+    cache_floor_ratio_bits: AtomicU64,
 }
 
 // 凭据失败/并发上限已迁出为 config.json 的 `credential` 组
@@ -704,13 +704,10 @@ impl MultiTokenManager {
         let rate_limit_cooldown_secs = config.rate_limit_cooldown_secs;
         let affinity_promote_threshold = config.affinity_promote_threshold.max(1);
         let affinity_map_ttl_secs = config.affinity_map_ttl_secs.max(1);
-        // 感知缓存放大比例：clamp 到 [0,1]（None 表示不放大）
-        let perceived_cache_hit_ratio = config
-            .perceived_cache_hit_ratio
-            .map(|r| r.clamp(0.0, 1.0));
-        // 缓存倍率 / 命中阈值初值来自 config.cache
+        // 缓存上报三参数初值来自 config.cache
         let cache_read_multiplier = config.cache.read_multiplier;
-        let cache_hit_threshold = config.cache.hit_threshold;
+        let cache_cap_ratio = config.cache.cap_ratio.clamp(0.0, 1.0);
+        let cache_floor_ratio = config.cache.floor_ratio.clamp(0.0, cache_cap_ratio);
         // 把 cache_sim 全局单例的 TTL / 容量同步为 config.cache 值（运行时可再热调）
         crate::kiro::cache_sim::global().set_ttl_secs(config.cache.sim_ttl_secs);
         crate::kiro::cache_sim::global().set_max_sessions(config.cache.max_sessions);
@@ -729,9 +726,9 @@ impl MultiTokenManager {
             affinity_map: Mutex::new(HashMap::new()),
             affinity_promote_threshold: AtomicU32::new(affinity_promote_threshold),
             affinity_map_ttl_secs: AtomicU64::new(affinity_map_ttl_secs),
-            perceived_cache_hit_ratio: Mutex::new(perceived_cache_hit_ratio),
             cache_read_multiplier_bits: AtomicU64::new(cache_read_multiplier.to_bits()),
-            cache_hit_threshold_bits: AtomicU64::new(cache_hit_threshold.to_bits()),
+            cache_cap_ratio_bits: AtomicU64::new(cache_cap_ratio.to_bits()),
+            cache_floor_ratio_bits: AtomicU64::new(cache_floor_ratio.to_bits()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -2450,39 +2447,12 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取感知缓存命中放大比例（None=不放大；Admin API / 请求路径读 live 值）
-    pub fn get_perceived_cache_hit_ratio(&self) -> Option<f64> {
-        *self.perceived_cache_hit_ratio.lock()
-    }
-
-    /// 设置感知缓存命中放大比例（Admin API）
-    ///
-    /// `Some(r)` 时 clamp 到 [0,1]；`None` 表示关闭放大、按真实/估算值上报。
-    /// 与其它运行时参数一致：先改内存、再落盘，落盘失败则回滚。
-    pub fn set_perceived_cache_hit_ratio(&self, ratio: Option<f64>) -> anyhow::Result<()> {
-        let ratio = ratio.map(|r| r.clamp(0.0, 1.0));
-        let previous = self.get_perceived_cache_hit_ratio();
-        if previous == ratio {
-            return Ok(());
-        }
-        *self.perceived_cache_hit_ratio.lock() = ratio;
-        if let Err(err) = self.persist_config_field(|c| c.perceived_cache_hit_ratio = ratio) {
-            *self.perceived_cache_hit_ratio.lock() = previous;
-            return Err(err);
-        }
-        match ratio {
-            Some(r) => tracing::info!("感知缓存命中放大比例已设置为: {:.4}", r),
-            None => tracing::info!("感知缓存命中放大已关闭（按真实值上报）"),
-        }
-        Ok(())
-    }
-
-    /// 缓存上报锚定放大倍率（live 值；请求路径读，>0）。
+    /// 缓存上报缩放倍率（live 值；请求路径读，>0）。
     pub fn get_cache_read_multiplier(&self) -> f64 {
         f64::from_bits(self.cache_read_multiplier_bits.load(Ordering::Relaxed))
     }
 
-    /// 设置缓存上报锚定放大倍率（Admin API；下界 0.0，<=0 由 inflate 回退默认）。
+    /// 设置缓存上报缩放倍率（Admin API；下界 0.0，<=0 由 usage 回退默认）。
     pub fn set_cache_read_multiplier(&self, multiplier: f64) -> anyhow::Result<()> {
         let m = multiplier.max(0.0);
         let previous = self.get_cache_read_multiplier();
@@ -2494,28 +2464,49 @@ impl MultiTokenManager {
             self.cache_read_multiplier_bits.store(previous.to_bits(), Ordering::Relaxed);
             return Err(err);
         }
-        tracing::info!("缓存上报放大倍率已设置为: {:.4}", m);
+        tracing::info!("缓存上报缩放倍率已设置为: {:.4}", m);
         Ok(())
     }
 
-    /// metering 反推命中判定阈值（live 值；末级估算兜底读）。
-    pub fn get_cache_hit_threshold(&self) -> f64 {
-        f64::from_bits(self.cache_hit_threshold_bits.load(Ordering::Relaxed))
+    /// 命中上限比率（live 值；上报封顶 = total × 此值）。
+    pub fn get_cache_cap_ratio(&self) -> f64 {
+        f64::from_bits(self.cache_cap_ratio_bits.load(Ordering::Relaxed))
     }
 
-    /// 设置 metering 反推命中判定阈值（Admin API）。
-    pub fn set_cache_hit_threshold(&self, threshold: f64) -> anyhow::Result<()> {
-        let t = threshold.max(0.0);
-        let previous = self.get_cache_hit_threshold();
-        if previous == t {
+    /// 设置命中上限比率（Admin API；clamp 到 [0,1]）。
+    pub fn set_cache_cap_ratio(&self, ratio: f64) -> anyhow::Result<()> {
+        let r = ratio.clamp(0.0, 1.0);
+        let previous = self.get_cache_cap_ratio();
+        if previous == r {
             return Ok(());
         }
-        self.cache_hit_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
-        if let Err(err) = self.persist_config_field(|c| c.cache.hit_threshold = t) {
-            self.cache_hit_threshold_bits.store(previous.to_bits(), Ordering::Relaxed);
+        self.cache_cap_ratio_bits.store(r.to_bits(), Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.cache.cap_ratio = r) {
+            self.cache_cap_ratio_bits.store(previous.to_bits(), Ordering::Relaxed);
             return Err(err);
         }
-        tracing::info!("缓存命中判定阈值已设置为: {:.4}", t);
+        tracing::info!("缓存命中上限比率已设置为: {:.4}", r);
+        Ok(())
+    }
+
+    /// 最低比率（live 值；上报下限 = total × 此值）。
+    pub fn get_cache_floor_ratio(&self) -> f64 {
+        f64::from_bits(self.cache_floor_ratio_bits.load(Ordering::Relaxed))
+    }
+
+    /// 设置最低比率（Admin API；clamp 到 [0,1]，逻辑上不应超过 cap，usage 层会再夹）。
+    pub fn set_cache_floor_ratio(&self, ratio: f64) -> anyhow::Result<()> {
+        let r = ratio.clamp(0.0, 1.0);
+        let previous = self.get_cache_floor_ratio();
+        if previous == r {
+            return Ok(());
+        }
+        self.cache_floor_ratio_bits.store(r.to_bits(), Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.cache.floor_ratio = r) {
+            self.cache_floor_ratio_bits.store(previous.to_bits(), Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("缓存最低比率已设置为: {:.4}", r);
         Ok(())
     }
 
@@ -3535,8 +3526,8 @@ mod tests {
     }
 
     #[test]
-    fn perceived_cache_hit_ratio_runtime_tunable() {
-        // 默认 config 不配 ratio → None
+    fn cache_report_params_runtime_tunable() {
+        // 默认来自 config.cache：multiplier=1.8, cap=0.9, floor=0.0
         let config = Config::default();
         let manager = MultiTokenManager::new(
             config,
@@ -3546,28 +3537,29 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), None);
+        assert_eq!(manager.get_cache_read_multiplier(), 1.8);
+        assert_eq!(manager.get_cache_cap_ratio(), 0.9);
+        assert_eq!(manager.get_cache_floor_ratio(), 0.0);
 
-        // 设置一个值（config_path=None → 仅内存生效，不落盘）
-        manager.set_perceived_cache_hit_ratio(Some(0.95)).unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(0.95));
+        // 倍率热调（config_path=None → 仅内存）
+        manager.set_cache_read_multiplier(2.5).unwrap();
+        assert_eq!(manager.get_cache_read_multiplier(), 2.5);
 
-        // 越界值被 clamp 到 [0,1]
-        manager.set_perceived_cache_hit_ratio(Some(1.5)).unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(1.0));
-        manager.set_perceived_cache_hit_ratio(Some(-0.2)).unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(0.0));
-
-        // 显式关闭
-        manager.set_perceived_cache_hit_ratio(None).unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), None);
+        // cap/floor clamp 到 [0,1]
+        manager.set_cache_cap_ratio(1.5).unwrap();
+        assert_eq!(manager.get_cache_cap_ratio(), 1.0);
+        manager.set_cache_floor_ratio(-0.2).unwrap();
+        assert_eq!(manager.get_cache_floor_ratio(), 0.0);
+        manager.set_cache_floor_ratio(0.5).unwrap();
+        assert_eq!(manager.get_cache_floor_ratio(), 0.5);
     }
 
     #[test]
-    fn perceived_cache_hit_ratio_inits_from_config_clamped() {
-        // config 里配了越界值，初始化时也应 clamp
+    fn cache_report_params_init_from_config_clamped() {
+        // config 里配了越界 cap，初始化时 clamp 到 [0,1]
         let mut config = Config::default();
-        config.perceived_cache_hit_ratio = Some(2.0);
+        config.cache.cap_ratio = 2.0;
+        config.cache.floor_ratio = 0.3;
         let manager = MultiTokenManager::new(
             config,
             vec![KiroCredentials::default()],
@@ -3576,6 +3568,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(manager.get_perceived_cache_hit_ratio(), Some(1.0));
+        assert_eq!(manager.get_cache_cap_ratio(), 1.0);
+        assert_eq!(manager.get_cache_floor_ratio(), 0.3);
     }
 }

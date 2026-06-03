@@ -17,29 +17,31 @@ use serde::{Deserialize, Serialize};
 /// 对应 config.json 的 `cache` 对象。这些项调整后应立即生效（计费/命中直接相关，
 /// 运营会频繁调），故在 token_manager 里持有运行时 cell，并经 admin 接口热更新 + 持久化。
 ///
-/// 注：缓存上报封顶比例沿用既有顶层字段 `perceivedCacheHitRatio`（未并入此组以保持
-/// 向后兼容），逻辑上属于本组。
+/// 上报公式（v53，统一走模拟器）：
+/// `reported = clamp(hit × read_multiplier, total × floor_ratio, total × cap_ratio)`。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheConfig {
-    /// prefix 缓存模拟器条目存活时间（秒）。超时后下一轮视为冷启动 miss。
-    /// 原 `cache_sim::ENTRY_TTL`（300）。
+    /// prefix 缓存模拟器条目存活时间（秒）。超时后下一轮视为冷启动 miss。原 300。
     #[serde(default = "default_sim_ttl_secs")]
     pub sim_ttl_secs: u64,
 
-    /// 缓存模拟器最多保留的会话数（LRU 淘汰）。原 `cache_sim::MAX_SESSIONS`（4096）。
+    /// 缓存模拟器最多保留的会话数（LRU 淘汰）。原 4096。
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
 
-    /// cache_read 上报锚定放大倍率：`reported = clamp(real × multiplier, real, prompt×cap)`。
-    /// 原 `usage::CACHE_READ_MULTIPLIER`（1.3）。
+    /// 缩放倍率：模拟器命中 token × 此倍率换取更大折扣。默认 1.8。
     #[serde(default = "default_read_multiplier")]
     pub read_multiplier: f64,
 
-    /// metering 反推命中判定阈值：`ratio < threshold` 视为命中。
-    /// 原 `cache_estimate::HIT_THRESHOLD`（0.8）。仅影响末级估算兜底。
-    #[serde(default = "default_hit_threshold")]
-    pub hit_threshold: f64,
+    /// 命中上限比率：上报封顶 = total × 此值（防止假到全命中）。默认 0.9。
+    #[serde(default = "default_cap_ratio")]
+    pub cap_ratio: f64,
+
+    /// 最低比率：上报下限 = total × 此值。默认 0.0（冷启动如实报 0、不造假；
+    /// 调高可消灭吓人的 0% 全价行）。
+    #[serde(default = "default_floor_ratio")]
+    pub floor_ratio: f64,
 }
 
 fn default_sim_ttl_secs() -> u64 {
@@ -49,10 +51,13 @@ fn default_max_sessions() -> usize {
     4096
 }
 fn default_read_multiplier() -> f64 {
-    1.3
+    1.8
 }
-fn default_hit_threshold() -> f64 {
-    0.8
+fn default_cap_ratio() -> f64 {
+    0.9
+}
+fn default_floor_ratio() -> f64 {
+    0.0
 }
 
 impl Default for CacheConfig {
@@ -61,7 +66,8 @@ impl Default for CacheConfig {
             sim_ttl_secs: default_sim_ttl_secs(),
             max_sessions: default_max_sessions(),
             read_multiplier: default_read_multiplier(),
-            hit_threshold: default_hit_threshold(),
+            cap_ratio: default_cap_ratio(),
+            floor_ratio: default_floor_ratio(),
         }
     }
 }
@@ -185,8 +191,9 @@ mod tests {
         let c = CacheConfig::default();
         assert_eq!(c.sim_ttl_secs, 300);
         assert_eq!(c.max_sessions, 4096);
-        assert_eq!(c.read_multiplier, 1.3);
-        assert_eq!(c.hit_threshold, 0.8);
+        assert_eq!(c.read_multiplier, 1.8);
+        assert_eq!(c.cap_ratio, 0.9);
+        assert_eq!(c.floor_ratio, 0.0);
     }
 
     #[test]
@@ -213,7 +220,7 @@ mod tests {
     fn empty_json_yields_all_defaults() {
         // 向后兼容硬约束：空对象 {} 反序列化后 = 全默认（= 旧 const 值）
         let c: CacheConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(c.read_multiplier, 1.3);
+        assert_eq!(c.read_multiplier, 1.8);
         let r: RetryConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(r.max_total_retries, 9);
         let cr: CredentialConfig = serde_json::from_str("{}").unwrap();

@@ -318,9 +318,9 @@ impl AdminService {
             cooldown_secs: self.token_manager.get_rate_limit_cooldown_secs(),
             affinity_promote_threshold: self.token_manager.get_affinity_promote_threshold(),
             affinity_map_ttl_secs: self.token_manager.get_affinity_map_ttl_secs(),
-            perceived_cache_hit_ratio: self.token_manager.get_perceived_cache_hit_ratio(),
             cache_read_multiplier: self.token_manager.get_cache_read_multiplier(),
-            cache_hit_threshold: self.token_manager.get_cache_hit_threshold(),
+            cache_cap_ratio: self.token_manager.get_cache_cap_ratio(),
+            cache_floor_ratio: self.token_manager.get_cache_floor_ratio(),
             cache_sim_ttl_secs: self.token_manager.get_cache_sim_ttl_secs(),
             cache_max_sessions: self.token_manager.get_cache_max_sessions(),
         }
@@ -356,21 +356,6 @@ impl AdminService {
                 .set_affinity_map_ttl_secs(ttl)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
-        // 感知缓存放大：disable=true 优先（显式关闭）；否则若给了 ratio 就设置
-        if req.disable_perceived_cache == Some(true) {
-            self.token_manager
-                .set_perceived_cache_hit_ratio(None)
-                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        } else if let Some(r) = req.perceived_cache_hit_ratio {
-            if !(0.0..=1.0).contains(&r) {
-                return Err(AdminServiceError::InvalidCredential(
-                    "perceivedCacheHitRatio 必须在 [0, 1] 区间".to_string(),
-                ));
-            }
-            self.token_manager
-                .set_perceived_cache_hit_ratio(Some(r))
-                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        }
         if let Some(m) = req.cache_read_multiplier {
             if !(0.0..=10.0).contains(&m) {
                 return Err(AdminServiceError::InvalidCredential(
@@ -381,14 +366,24 @@ impl AdminService {
                 .set_cache_read_multiplier(m)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
-        if let Some(t) = req.cache_hit_threshold {
-            if !(0.0..=5.0).contains(&t) {
+        if let Some(r) = req.cache_cap_ratio {
+            if !(0.0..=1.0).contains(&r) {
                 return Err(AdminServiceError::InvalidCredential(
-                    "cacheHitThreshold 必须在 [0, 5] 区间".to_string(),
+                    "cacheCapRatio 必须在 [0, 1] 区间".to_string(),
                 ));
             }
             self.token_manager
-                .set_cache_hit_threshold(t)
+                .set_cache_cap_ratio(r)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(r) = req.cache_floor_ratio {
+            if !(0.0..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "cacheFloorRatio 必须在 [0, 1] 区间".to_string(),
+                ));
+            }
+            self.token_manager
+                .set_cache_floor_ratio(r)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
         if let Some(ttl) = req.cache_sim_ttl_secs {

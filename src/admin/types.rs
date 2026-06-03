@@ -228,12 +228,12 @@ pub struct SchedulingResponse {
     pub affinity_promote_threshold: u32,
     /// 会话亲和映射 TTL（秒）
     pub affinity_map_ttl_secs: u64,
-    /// 感知缓存命中放大比例（0-1；null = 未启用放大，按真实值上报）
-    pub perceived_cache_hit_ratio: Option<f64>,
-    /// 缓存上报锚定放大倍率（config.cache.readMultiplier）
+    /// 缓存上报缩放倍率（config.cache.readMultiplier）
     pub cache_read_multiplier: f64,
-    /// metering 反推命中判定阈值（config.cache.hitThreshold）
-    pub cache_hit_threshold: f64,
+    /// 命中上限比率（config.cache.capRatio）：上报封顶 = total × 此值
+    pub cache_cap_ratio: f64,
+    /// 最低比率（config.cache.floorRatio）：上报下限 = total × 此值
+    pub cache_floor_ratio: f64,
     /// 缓存模拟器条目 TTL（秒，config.cache.simTtlSecs）
     pub cache_sim_ttl_secs: u64,
     /// 缓存模拟器最大会话数（config.cache.maxSessions）
@@ -248,14 +248,12 @@ pub struct UpdateSchedulingRequest {
     pub cooldown_secs: Option<u64>,
     pub affinity_promote_threshold: Option<u32>,
     pub affinity_map_ttl_secs: Option<u64>,
-    /// 设置感知缓存放大比例（0-1，会被 clamp）。缺省=不改；与 disable_perceived_cache 互斥
-    pub perceived_cache_hit_ratio: Option<f64>,
-    /// 显式关闭感知缓存放大（true=设为 None，按真实值上报）。缺省=不改
-    pub disable_perceived_cache: Option<bool>,
-    /// 缓存上报放大倍率。缺省=不改
+    /// 缓存上报缩放倍率。缺省=不改
     pub cache_read_multiplier: Option<f64>,
-    /// metering 命中判定阈值。缺省=不改
-    pub cache_hit_threshold: Option<f64>,
+    /// 命中上限比率（0-1，会被 clamp）。缺省=不改
+    pub cache_cap_ratio: Option<f64>,
+    /// 最低比率（0-1，会被 clamp）。缺省=不改
+    pub cache_floor_ratio: Option<f64>,
     /// 缓存模拟器 TTL（秒）。缺省=不改
     pub cache_sim_ttl_secs: Option<u64>,
     /// 缓存模拟器最大会话数。缺省=不改

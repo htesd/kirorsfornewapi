@@ -127,8 +127,16 @@ export interface Scheduling {
   cooldownSecs: number
   affinityPromoteThreshold: number
   affinityMapTtlSecs: number
-  /** 感知缓存命中放大比例（0-1；null = 未启用放大，按真实值上报） */
-  perceivedCacheHitRatio: number | null
+  /** 缓存上报缩放倍率：reported = clamp(hit×此值, total×floor, total×cap) */
+  cacheReadMultiplier: number
+  /** 命中上限比率：上报封顶 = total × 此值（0-1） */
+  cacheCapRatio: number
+  /** 最低比率：上报下限 = total × 此值（0-1；0=冷启动如实报0） */
+  cacheFloorRatio: number
+  /** 缓存模拟器条目 TTL（秒） */
+  cacheSimTtlSecs: number
+  /** 缓存模拟器最大会话数 */
+  cacheMaxSessions: number
 }
 
 export type UpdateSchedulingPayload = Partial<{
@@ -136,10 +144,11 @@ export type UpdateSchedulingPayload = Partial<{
   cooldownSecs: number
   affinityPromoteThreshold: number
   affinityMapTtlSecs: number
-  /** 设置放大比例（0-1）。与 disablePerceivedCache 互斥 */
-  perceivedCacheHitRatio: number
-  /** true = 关闭放大（设为 null） */
-  disablePerceivedCache: boolean
+  cacheReadMultiplier: number
+  cacheCapRatio: number
+  cacheFloorRatio: number
+  cacheSimTtlSecs: number
+  cacheMaxSessions: number
 }>
 
 // 获取调度策略全部参数

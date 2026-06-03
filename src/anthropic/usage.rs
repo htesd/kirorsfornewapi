@@ -1,68 +1,89 @@
-//! Anthropic `usage` 对象的构建 + 缓存命中放大
+//! Anthropic `usage` 对象的构建 + 缓存命中上报
 //!
 //! Anthropic API 的 usage 字段除 `input_tokens`/`output_tokens` 外，还可携带
 //! `cache_read_input_tokens` 与 `cache_creation_input_tokens`。NewAPI 等中转
 //! 网关按这些字段算计费(cache_read 通常 0.1× 输入价)。
 //!
-//! 历史 bug：v18 之前我们从未在响应里 emit `cache_read_input_tokens`，导致
-//! NewAPI 始终全价计费、缓存优化白做。v20 起统一接入这条路径。
+//! ## 缓存上报模型（v53 重写：统一走模拟器 + 三参数夹限）
 //!
-//! ## 缓存上报放大（锚定真实值 × 倍率，封顶）
+//! 历史上叠了"上游真值 / 模拟器 / metering 反推"三层优先级 + 放大 + 封顶 + uncached
+//! 反算，环节多、互相打架，产出过"上报 < 真实值"、"上报 > prompt"、间歇 0% 等错乱。
 //!
-//! 反代拿到的 `cache_read` 来源有二：① Kiro 上游 `tokenUsageEvent` 真值
-//! （opus-4-7/4-8 等，最准）；② 无真值时由 prefix 缓存模拟器
-//! [`crate::kiro::cache_sim`] 按真实 prefix cache 原理算出的模拟真值。
+//! **现行（唯一路径）**：完全由 prefix 缓存模拟器 [`crate::kiro::cache_sim`] 给出
+//! `(hit_tokens, total_tokens)`，按下式算上报：
 //!
-//! **历史教训（v27–v30）**：曾"只要判命中就无条件覆盖成 `prompt × 0.95`"，
-//! 导致上报值是一整列恒定 0.95、与真实命中率（0.12–0.62 自然散布）完全脱节，
-//! 一眼可辨为合成常数、经不起账单审计。
+//! ```text
+//! reported = clamp(hit_tokens × multiplier, total × floor_ratio, total × cap_ratio)
+//! reported = clamp(reported, 0, total)          // 恒不超过总上下文
+//! uncached_input = total - reported             // cap_ratio<1 保证恒为正
+//! ```
 //!
-//! **现行（锚定放大）**：`reported = clamp(real × MULTIPLIER, real, prompt × CAP)`。
-//! - 锚定在真实/模拟真值上，**保留其天然波动形状**（会话越长命中越高）；
-//! - 乘一个温和倍率换取更大折扣，但封顶在 `prompt × CAP`（不会假到接近全命中）；
-//! - `real = 0`（冷启动/换模型/未命中）→ 报 0，不再凭空捏造命中。
-//!
-//! `target_ratio`（来自配置 `perceived_cache_hit_ratio`）现语义为**封顶比例 CAP**。
+//! 三个运营可调参数（admin 面板热调，见 config.cache）：
+//! - `multiplier`（缩放倍率，默认 1.8）：hit 乘此倍率换取更大折扣；
+//! - `cap_ratio`（命中上限比率，默认 0.9）：上报封顶 = total × cap_ratio，杜绝假到全命中；
+//! - `floor_ratio`（最低比率，默认 0.0）：上报下限 = total × floor_ratio。
+//!   默认 0 → 冷启动/无命中如实报 0、不造假；调高可消灭吓人的 0% 全价行。
 
-/// 锚定放大倍率默认值：在真实/模拟 cache_read 之上乘此倍率换取更大折扣。
-/// 运行时实际值来自 config.cache.readMultiplier（admin 可热调），由调用方传入。
-pub const DEFAULT_CACHE_READ_MULTIPLIER: f64 = 1.3;
+/// 缩放倍率默认值。运行时实际值来自 config.cache.readMultiplier（admin 可热调）。
+pub const DEFAULT_CACHE_READ_MULTIPLIER: f64 = 1.8;
 
-/// 按"锚定真实值 × 倍率、封顶 prompt×cap"上报缓存命中 token 数。
+/// 命中上限比率默认值（上报封顶 = total × 此值）。
+pub const DEFAULT_CACHE_CAP_RATIO: f64 = 0.9;
+
+/// 最低比率默认值（上报下限 = total × 此值）。0 = 冷启动如实报 0、不造假。
+pub const DEFAULT_CACHE_FLOOR_RATIO: f64 = 0.0;
+
+/// 按"模拟器命中 × 倍率、再用上下限比率夹住"算上报 cache_read。
 ///
-/// - `cache_read <= 0` 或 `prompt <= 0`：原样返回（夹非负），即未命中报 0。
-/// - `cap_ratio = None`：不放大，原样返回真实/模拟值（夹到 `[0, prompt]`）。
-/// - 否则：`reported = clamp(cache_read × multiplier, cache_read, round(prompt × cap))`，
-///   再夹到 `[0, prompt]`。下界取 `cache_read` 保证放大后不低于真实值；
-///   上界 `prompt × cap` 防止假到接近全命中。
+/// 按"模拟器命中比例 × 倍率、再用上下限比率夹住"算上报 cache_read。
 ///
-/// `multiplier` 来自 config.cache.readMultiplier（≤0 时回退默认 1.3）。
-pub fn inflate_cache_read(
-    prompt_tokens: i32,
-    cache_read: i32,
-    cap_ratio: Option<f64>,
+/// **同口径修复（审查 CRITICAL）**：`hit` 与 `sim_total` 都来自模拟器自己的 tokenizer
+/// （canon 串估算），二者比值 `frac = hit / sim_total` 才有稳定物理意义。而上报给中转
+/// 网关的基准是 `report_total`（Kiro contextUsageEvent 的权威 token 数）。于是先在同口径
+/// 内算命中比例，再把比例映射到权威基准并放大、夹限：
+///
+/// ```text
+/// frac     = hit / sim_total                       // 同口径比例
+/// reported = clamp(frac × report_total × mult, report_total × floor, report_total × cap)
+/// reported = clamp(reported, 0, report_total)
+/// ```
+///
+/// - `report_total <= 0`：返回 0（无上下文）。
+/// - `sim_total <= 0`：命中比例无意义 → 返回 0（除非 floor>0 抬到 floor）。
+///
+/// 参数 clamp：`multiplier <= 0` 回退默认；`cap` 夹到 `[0,1]`；`floor` 夹到 `[0, cap]`。
+pub fn reported_cache_read(
+    report_total: i32,
+    hit_tokens: i32,
+    sim_total: i32,
     multiplier: f64,
+    cap_ratio: f64,
+    floor_ratio: f64,
 ) -> i32 {
-    if cache_read <= 0 || prompt_tokens <= 0 {
-        return cache_read.max(0);
+    if report_total <= 0 {
+        return 0;
     }
+    let total = report_total as f64;
     let mult = if multiplier > 0.0 {
         multiplier
     } else {
         DEFAULT_CACHE_READ_MULTIPLIER
     };
-    let actual = cache_read.min(prompt_tokens);
-    match cap_ratio {
-        Some(cap) if cap > 0.0 => {
-            let cap_tokens = ((prompt_tokens as f64) * cap).round() as i32;
-            // 上界 = min(prompt×cap, prompt)；下界 = 真实值（放大不应低于真实）。
-            let upper = cap_tokens.clamp(0, prompt_tokens);
-            let inflated = ((actual as f64) * mult).round() as i32;
-            // 若 upper < actual（cap 设得很低），则以 actual 为准（真实值不应被压低）。
-            inflated.clamp(actual.min(upper), upper.max(actual)).clamp(0, prompt_tokens)
-        }
-        _ => actual,
-    }
+    let cap = cap_ratio.clamp(0.0, 1.0);
+    let floor = floor_ratio.clamp(0.0, cap);
+
+    // 同口径命中比例（sim_total<=0 时无从算比例，frac=0，仅由 floor 决定下限）。
+    let frac = if sim_total > 0 {
+        (hit_tokens.max(0) as f64) / (sim_total as f64)
+    } else {
+        0.0
+    };
+
+    let scaled = frac * total * mult;
+    let upper = total * cap;
+    let lower = total * floor;
+    let reported = scaled.clamp(lower, upper);
+    (reported.round() as i32).clamp(0, report_total)
 }
 
 /// 构建 Anthropic `usage` JSON 对象。
@@ -105,57 +126,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_ratio_returns_actual() {
-        assert_eq!(inflate_cache_read(10000, 4000, None, 1.3), 4000);
+    fn zero_total_returns_zero() {
+        assert_eq!(reported_cache_read(0, 100, 1000, 1.8, 0.9, 0.0), 0);
+        assert_eq!(reported_cache_read(-1, 100, 1000, 1.8, 0.9, 0.0), 0);
     }
 
     #[test]
-    fn zero_cache_stays_zero() {
-        // 未命中（cache_read=0）→ 报 0，不凭空捏造
-        assert_eq!(inflate_cache_read(10000, 0, Some(0.85), 1.3), 0);
+    fn zero_sim_total_returns_floor() {
+        // sim_total<=0 → frac=0 → 仅由 floor 决定（floor=0 报 0）
+        assert_eq!(reported_cache_read(10000, 100, 0, 1.8, 0.9, 0.0), 0);
+        assert_eq!(reported_cache_read(10000, 100, 0, 1.8, 0.9, 0.3), 3000);
     }
 
     #[test]
-    fn anchored_multiply_below_cap() {
-        // real=4000, prompt=10000, ×1.3 = 5200 < cap(8500) → 5200
-        assert_eq!(inflate_cache_read(10000, 4000, Some(0.85), 1.3), 5200);
+    fn zero_hit_with_floor_zero_reports_zero() {
+        // 冷启动/无命中 + floor=0 → 报 0，不造假
+        assert_eq!(reported_cache_read(10000, 0, 10000, 1.8, 0.9, 0.0), 0);
     }
 
     #[test]
-    fn anchored_multiply_clamped_to_cap() {
-        // real=7000, ×1.3 = 9100 > cap(0.85×10000=8500) → 封顶 8500
-        assert_eq!(inflate_cache_read(10000, 7000, Some(0.85), 1.3), 8500);
+    fn zero_hit_with_floor_lifts_to_floor() {
+        // floor=0.3 → 即便 hit=0 也抬到 total×0.3=3000（运营用它消灭 0% 行）
+        assert_eq!(reported_cache_read(10000, 0, 10000, 1.8, 0.9, 0.3), 3000);
     }
 
     #[test]
-    fn reported_never_below_real() {
-        // 即便 cap 很低，放大值也不应低于真实值（下界 = real）
-        // real=6000, cap=0.5 → cap_tokens=5000 < real → 以 real 为下界，结果 = 6000
-        assert_eq!(inflate_cache_read(10000, 6000, Some(0.5), 1.3), 6000);
+    fn frac_scaled_below_cap() {
+        // hit=2000/sim_total=10000 → frac=0.2；report_total=10000，×1.8 → 3600 < cap(9000)
+        assert_eq!(reported_cache_read(10000, 2000, 10000, 1.8, 0.9, 0.0), 3600);
+    }
+
+    #[test]
+    fn frac_scaled_clamped_to_cap() {
+        // frac=0.6, ×1.8=1.08 → 1.08×10000=10800 > cap(9000) → 封顶 9000
+        assert_eq!(reported_cache_read(10000, 6000, 10000, 1.8, 0.9, 0.0), 9000);
+    }
+
+    #[test]
+    fn cross_tokenizer_uses_fraction_not_absolute() {
+        // 关键(审查 CRITICAL 修复)：sim 口径与 report 口径不同也按比例映射，不混用绝对值。
+        // sim: hit=3000/sim_total=6000 → frac=0.5；report_total=20000，×1.8 → 0.5×20000×1.8=18000
+        //  > cap(0.9×20000=18000) → 恰好 18000
+        assert_eq!(reported_cache_read(20000, 3000, 6000, 1.8, 0.9, 0.0), 18000);
+        // 若错误地把 sim 的 hit=3000 当绝对值 ×1.8=5400，会严重低估——证明用的是比例
+        assert_ne!(reported_cache_read(20000, 3000, 6000, 1.8, 0.9, 0.0), 5400);
+    }
+
+    #[test]
+    fn reported_never_exceeds_total() {
+        // frac=0.8, cap=1.0, ×1.8 → 1.44×1000=1440 > total → 夹到 total
+        assert_eq!(reported_cache_read(1000, 800, 1000, 1.8, 1.0, 0.0), 1000);
     }
 
     #[test]
     fn preserves_variation_shape() {
-        // 关键：不同真实值产出不同上报值（不再是恒定常数），保留波动形状
-        let prompt = 11000;
-        let r_low = inflate_cache_read(prompt, 1988, Some(0.85), 1.3); // 早轮低命中
-        let r_high = inflate_cache_read(prompt, 6739, Some(0.85), 1.3); // 晚轮高命中
-        assert!(r_low < r_high, "上报值应随真实命中升高: {r_low} vs {r_high}");
-        // 低命中 1988×1.3≈2584；高命中 6739×1.3≈8761 但封顶 0.85×11000=9350 → 8761
-        assert_eq!(r_low, 2584);
-        assert_eq!(r_high, 8761);
+        // 不同命中比例产出不同上报值，保留波动形状（会话越长命中越高）
+        let total = 11000;
+        let r_low = reported_cache_read(total, 1500, total, 1.8, 0.9, 0.0); // 早轮低命中
+        let r_high = reported_cache_read(total, 5000, total, 1.8, 0.9, 0.0); // 晚轮高命中
+        assert!(r_low < r_high, "上报值应随命中升高: {r_low} vs {r_high}");
+        assert_eq!(r_low, 2700); // frac=1500/11000, ×11000×1.8 = 1500×1.8 = 2700
+        assert_eq!(r_high, 9000); // 5000×1.8=9000 < cap(9900) → 9000
     }
 
     #[test]
-    fn clamped_to_prompt() {
-        // real 接近 prompt，cap=1.0：×1.3 会超 prompt，最终夹到 prompt
-        assert_eq!(inflate_cache_read(1000, 999, Some(1.0), 1.3), 1000);
+    fn multiplier_nonpositive_falls_back_to_default() {
+        // multiplier<=0 → 用默认 1.8
+        assert_eq!(
+            reported_cache_read(10000, 2000, 10000, 0.0, 0.9, 0.0),
+            reported_cache_read(10000, 2000, 10000, DEFAULT_CACHE_READ_MULTIPLIER, 0.9, 0.0)
+        );
     }
 
     #[test]
-    fn invalid_prompt_returns_clamped_cache() {
-        assert_eq!(inflate_cache_read(0, 100, Some(0.85), 1.3), 100);
-        assert_eq!(inflate_cache_read(-1, 100, Some(0.85), 1.3), 100);
+    fn floor_clamped_below_cap() {
+        // floor 设得比 cap 高 → floor 被夹到 cap，结果不超过 cap×total
+        // hit=0, cap=0.5, floor=0.9 → floor 夹到 0.5 → 报 total×0.5=5000
+        assert_eq!(reported_cache_read(10000, 0, 10000, 1.8, 0.5, 0.9), 5000);
     }
 
     #[test]

@@ -243,24 +243,107 @@ pub fn observe(session_key: &str, model: &str, curr: Vec<MsgFingerprint>) -> Sim
 /// 从处理后的 [`ConversationState`] 抽取指纹序列。
 ///
 /// 顺序严格对齐发给 Kiro 的真实 prefix：`history[0..]` + `currentMessage`。
-/// 每条消息的"内容"取其 JSON 序列化（含 content / tool_uses / images / documents
-/// 等所有参与上下文的字段），确保任何变化都会改变指纹、打断公共前缀——这正是
-/// 真实 prefix cache 的判定粒度。序列化失败的消息退化为空串指纹（极罕见）。
+///
+/// **关键（v53 修复"用户提问轮"崩盘）**：每条消息的指纹只取其**稳定语义内容**
+/// —— role + 正文 + tool_results(id/状态/内容) + tool_uses(id/name/input) + 图片/文档
+/// 计数。**刻意忽略两类东西**：
+///   1. `tools` 列表（几百个工具定义）—— 它不是对话内容，且只挂在 currentMessage 上；
+///   2. 容器结构差异（`UserInputMessage` vs `UserMessage`/`AssistantMessage` 的 JSON 形状）。
+///
+/// 为什么必须这样：同一句用户输入，本轮在 `currentMessage`（带 tools、`UserInputMessage`
+/// 结构），下一轮沉淀进 `history`（不带 tools、`UserMessage` 结构）。若按整条 JSON 序列化
+/// 算指纹，**同一句话在两轮的指纹必然不同** → 公共前缀在 history/current 接缝处 break →
+/// 每个"用户提问轮"都被算成低命中甚至 0（实测线上间歇崩盘的真正机理）。改取稳定语义内容
+/// 后，一条消息无论在 current 还是 history 都得到**相同指纹**，前缀和随会话平滑单调增长。
 ///
 /// 注意：**不含** `conversationId` / `agentContinuationId` 等会话级元数据——
 /// 它们不属于被缓存的 prompt 前缀内容。
 pub fn fingerprints_from_state(
     state: &crate::kiro::model::requests::conversation::ConversationState,
 ) -> Vec<MsgFingerprint> {
+    use crate::kiro::model::requests::conversation::Message;
     let mut fps = Vec::with_capacity(state.history.len() + 1);
     for msg in &state.history {
-        let s = serde_json::to_string(msg).unwrap_or_default();
-        fps.push(fingerprint(&s));
+        let canon = match msg {
+            Message::User(u) => canon_user(
+                &u.user_input_message.content,
+                &u.user_input_message.user_input_message_context.tool_results,
+                u.user_input_message.images.len(),
+                u.user_input_message.documents.len(),
+            ),
+            Message::Assistant(a) => canon_assistant(
+                &a.assistant_response_message.content,
+                a.assistant_response_message.tool_uses.as_deref(),
+            ),
+        };
+        fps.push(fingerprint(&canon));
     }
-    let cur = serde_json::to_string(&state.current_message.user_input_message)
-        .unwrap_or_default();
-    fps.push(fingerprint(&cur));
+    let cur = &state.current_message.user_input_message;
+    let canon = canon_user(
+        &cur.content,
+        &cur.user_input_message_context.tool_results,
+        cur.images.len(),
+        cur.documents.len(),
+    );
+    fps.push(fingerprint(&canon));
     fps
+}
+
+/// 规范化一条 user 消息为稳定语义字符串（current 与 history 走同一逻辑）。
+/// 忽略 tools 列表与容器结构差异，使同一内容跨轮指纹一致。
+fn canon_user(
+    content: &str,
+    tool_results: &[crate::kiro::model::requests::tool::ToolResult],
+    n_images: usize,
+    n_documents: usize,
+) -> String {
+    let mut s = String::with_capacity(content.len() + 64);
+    s.push_str("U\x1f");
+    s.push_str(content);
+    for tr in tool_results {
+        s.push_str("\x1ftr:");
+        s.push_str(&tr.tool_use_id);
+        s.push('\x1e');
+        if let Some(st) = &tr.status {
+            s.push_str(st);
+        }
+        s.push('\x1e');
+        // content 是 Vec<Map>，序列化为稳定字符串（字段顺序由 serde_json 保证插入序，
+        // 但 Map 是 BTreeMap-like? serde_json::Map 默认保留插入序——同一来源同序，足够稳定）
+        if let Ok(c) = serde_json::to_string(&tr.content) {
+            s.push_str(&c);
+        }
+    }
+    if n_images > 0 {
+        s.push_str(&format!("\x1fimg:{}", n_images));
+    }
+    if n_documents > 0 {
+        s.push_str(&format!("\x1fdoc:{}", n_documents));
+    }
+    s
+}
+
+/// 规范化一条 assistant 消息为稳定语义字符串。
+fn canon_assistant(
+    content: &str,
+    tool_uses: Option<&[crate::kiro::model::requests::tool::ToolUseEntry]>,
+) -> String {
+    let mut s = String::with_capacity(content.len() + 64);
+    s.push_str("A\x1f");
+    s.push_str(content);
+    if let Some(tus) = tool_uses {
+        for tu in tus {
+            s.push_str("\x1ftu:");
+            s.push_str(&tu.tool_use_id);
+            s.push('\x1e');
+            s.push_str(&tu.name);
+            s.push('\x1e');
+            if let Ok(inp) = serde_json::to_string(&tu.input) {
+                s.push_str(&inp);
+            }
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -463,5 +546,93 @@ mod tests {
         s2.history = vec![Message::User(HistoryUserMessage::new("u1", "m"))];
         let f2 = fingerprints_from_state(&s2);
         assert_eq!(f1[0].hash, f2[0].hash, "相同首条 history 指纹应稳定");
+    }
+
+    #[test]
+    fn current_message_fingerprint_stable_after_sinking_into_history() {
+        // v53 核心回归：同一句用户输入，本轮在 currentMessage（带 tools，UserInputMessage
+        // 结构），下一轮沉淀进 history（不带 tools，UserMessage 结构）。两者指纹必须相同，
+        // 否则"用户提问轮"前缀在 history/current 接缝处 break → 间歇崩盘（线上实证）。
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, HistoryUserMessage, Message, UserInputMessage,
+            UserInputMessageContext, UserMessage,
+        };
+        use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
+
+        let make_tool = |name: &str| Tool {
+            tool_specification: ToolSpecification {
+                name: name.to_string(),
+                description: "x".to_string(),
+                input_schema: InputSchema::from_json(serde_json::json!({"type": "object"})),
+            },
+        };
+
+        // turn N: "解释这段代码" 作为 currentMessage，挂着 295 个 tools
+        let mut cur = UserInputMessage::default();
+        cur.content = "解释这段代码".to_string();
+        cur.model_id = "opus-4-8".to_string();
+        cur.user_input_message_context = UserInputMessageContext {
+            tool_results: vec![],
+            tools: (0..295).map(|i| make_tool(&format!("tool_{i}"))).collect(),
+        };
+        let mut s_cur = ConversationState::new("c");
+        s_cur.current_message = CurrentMessage::new(cur);
+        let f_cur = fingerprints_from_state(&s_cur);
+        let cur_fp = *f_cur.last().unwrap();
+
+        // turn N+1: 同一句话沉淀进 history（UserMessage，无 tools），currentMessage 换新内容
+        let mut sunk = UserMessage::new("解释这段代码", "opus-4-8");
+        sunk.user_input_message_context = UserInputMessageContext::default();
+        let mut s_next = ConversationState::new("c");
+        s_next.history = vec![Message::User(HistoryUserMessage {
+            user_input_message: sunk,
+        })];
+        let mut cur2 = UserInputMessage::default();
+        cur2.content = "下一个问题".to_string();
+        s_next.current_message = CurrentMessage::new(cur2);
+        let f_next = fingerprints_from_state(&s_next);
+        let sunk_fp = f_next[0];
+
+        assert_eq!(
+            cur_fp.hash, sunk_fp.hash,
+            "同一句话在 current(带295 tools) 与沉淀进 history 后指纹必须一致——这是缓存不崩的命门"
+        );
+        assert_eq!(cur_fp.tokens, sunk_fp.tokens, "token 数也应一致");
+    }
+
+    #[test]
+    fn tools_list_does_not_affect_fingerprint() {
+        // 同一 currentMessage 内容，tools 多寡不应改变指纹（tools 不是对话内容）。
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext,
+        };
+        use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
+        let make_tool = |name: &str| Tool {
+            tool_specification: ToolSpecification {
+                name: name.to_string(),
+                description: "x".to_string(),
+                input_schema: InputSchema::from_json(serde_json::json!({"type": "object"})),
+            },
+        };
+        let mut a = UserInputMessage::default();
+        a.content = "hi".into();
+        let mut b = a.clone();
+        a.user_input_message_context = UserInputMessageContext {
+            tool_results: vec![],
+            tools: vec![],
+        };
+        b.user_input_message_context = UserInputMessageContext {
+            tool_results: vec![],
+            tools: (0..50).map(|i| make_tool(&format!("t{i}"))).collect(),
+        };
+        let mut sa = ConversationState::new("c");
+        sa.current_message = CurrentMessage::new(a);
+        let mut sb = ConversationState::new("c");
+        sb.current_message = CurrentMessage::new(b);
+        assert_eq!(
+            fingerprints_from_state(&sa).last().unwrap().hash,
+            fingerprints_from_state(&sb).last().unwrap().hash,
+            "tools 多寡不应影响指纹"
+        );
     }
 }

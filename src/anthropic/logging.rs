@@ -115,36 +115,16 @@ pub fn observe_event(builder: &mut RequestRecordBuilder, event: &Event) {
 ///
 /// 调用方负责显式给 `status` —— 成功 / 错误 / 取消。
 ///
-/// 落库前在此 glue 层做派生计算：用 metering + token 估计 Kiro 缓存命中，
-/// 把反推的 cache_read 写进 cached_tokens。领域逻辑在 `kiro::cache_estimate`，
-/// db 层保持纯持久化、不感知计费模型。
+/// v53 起：缓存命中（cached_tokens）由请求路径的 prefix 模拟器直接写入，
+/// 此处不再做 metering 反推（旧 `apply_cache_estimate` 已废弃）。db 层保持纯持久化。
 pub fn finish(
     recorder: Option<&LogRecorder>,
-    mut builder: RequestRecordBuilder,
+    builder: RequestRecordBuilder,
     status: RequestStatus,
 ) {
     if let Some(rec) = recorder {
-        apply_cache_estimate(&mut builder);
         let record = builder.build(status);
         rec.record(record);
-    }
-}
-
-/// 用无缓存基线成本模型估计本次是否命中 Kiro prompt cache，
-/// 命中则把反推的 cache_read 写入 cached_tokens（NULL=无法判断，0=未命中，>0=命中）。
-fn apply_cache_estimate(builder: &mut RequestRecordBuilder) {
-    // 若 tokenUsageEvent 已写入精确的 cached_tokens，跳过估算
-    if builder.cached_tokens().is_some() {
-        return;
-    }
-    let (Some(prompt), Some(metering)) = (builder.prompt_tokens(), builder.metering_usage()) else {
-        return;
-    };
-    let output = builder.completion_tokens().unwrap_or(0);
-    if let Some(est) =
-        crate::kiro::cache_estimate::estimate(builder.model(), prompt, output, metering)
-    {
-        builder.set_cached_tokens(est.cache_read_tokens);
     }
 }
 

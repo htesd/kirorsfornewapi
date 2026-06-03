@@ -144,22 +144,22 @@ impl KiroProvider {
         }
     }
 
-    /// 当前生效的感知缓存命中放大比例（运行时可调，读 token_manager 的 live 值）
+    /// 当前生效的缓存上报缩放倍率（运行时可调，读 token_manager live 值）
     ///
     /// handler 在每次请求时调用此方法，而非使用启动时的 AppState 快照，
     /// 这样 Admin 面板热调后立即对后续请求生效。
-    pub fn perceived_cache_hit_ratio(&self) -> Option<f64> {
-        self.token_manager.get_perceived_cache_hit_ratio()
-    }
-
-    /// 当前生效的缓存上报放大倍率（运行时可调，读 token_manager live 值）
     pub fn cache_read_multiplier(&self) -> f64 {
         self.token_manager.get_cache_read_multiplier()
     }
 
-    /// 当前生效的 metering 命中判定阈值（运行时可调）
-    pub fn cache_hit_threshold(&self) -> f64 {
-        self.token_manager.get_cache_hit_threshold()
+    /// 当前生效的命中上限比率（运行时可调）
+    pub fn cache_cap_ratio(&self) -> f64 {
+        self.token_manager.get_cache_cap_ratio()
+    }
+
+    /// 当前生效的最低比率（运行时可调）
+    pub fn cache_floor_ratio(&self) -> f64 {
+        self.token_manager.get_cache_floor_ratio()
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client

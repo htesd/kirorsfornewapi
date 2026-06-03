@@ -1,5 +1,54 @@
 # Changelog
 
+## [v53] - 2026-06-03
+
+### Fix + Refactor —— 缓存计费统一走模拟器：修指纹崩盘 + 同口径比例上报 + 三参数热调
+
+**现象**：Claude Code 用户缓存命中在「~90% ↔ 0% 全价」剧烈横跳、扣费离谱；并出现
+「上报值(51912) < 真实命中(86029)」的错乱。
+
+**三个根因**：
+1. **指纹崩盘（核心）**：`cache_sim::fingerprints_from_state` 旧实现对每条消息整体
+   `serde_json::to_string` 算指纹。同一句用户输入，本轮在 `currentMessage`（结构
+   `UserInputMessage`，带几百个 tools 定义），下一轮沉淀进 `history`（结构 `UserMessage`，
+   不带 tools）→ JSON 字节不同 → 指纹不同 → 最长公共前缀在 history/current 接缝处 break
+   → **每个「用户提问轮」被算成 0 命中**。这是间歇崩盘的真正机理。
+2. **三层叠加打架**：上游真值 / 模拟器 / metering 反推三层优先级 + 放大 + 封顶 +
+   uncached 反算，环节多互相覆盖。
+3. **跨口径混用**：billing 用 Kiro 权威 total 配模拟器 hit，比值无物理意义。
+
+**修复（统一走 prefix 模拟器，上游真值/metering 不再参与计费）**：
+- **指纹改稳定语义内容**：`canon_user`/`canon_assistant` 提取 role + content +
+  tool_results(id/status/content) + tool_uses(id/name/input) + 图片/文档计数，
+  **忽略 tools 列表与容器结构差异**。同一句话在 current/history 指纹一致，前缀和随会话
+  平滑单调增长。回归测试覆盖「current 沉淀进 history 指纹不变」「tools 多寡不影响指纹」。
+- **同口径比例上报**（`usage::reported_cache_read`）：
+  `frac = hit / sim_total`（都来自模拟器 tokenizer，同口径）；
+  `reported = clamp(frac × report_total × multiplier, report_total×floor, report_total×cap)`。
+  `report_total` = Kiro contextUsageEvent 权威值（billing 基准）。cap<1 结构上杜绝「报>total」。
+- **三参数前端热调**（替换废弃的 `perceivedCacheHitRatio` 95% 单输入框）：
+  缩放倍率(1.8) / 命中上限比率(0.9) / 最低比率(0.0，冷启动如实报0；调高消灭0%行)。
+  config.cache.{readMultiplier,capRatio,floorRatio} + token_manager 运行时 cell + admin。
+
+### Design Rationale
+
+- **指纹算 conversation_state（转换后、发给 Kiro 的），不是用户原始报文**：因为 Kiro 的
+  真实 prefix cache 缓存的就是我们发给它的内容，模拟必须在同一份内容上算前缀才对得上。
+- **report_total 用 Kiro 权威值而非模拟器 total**：NewAPI 看到的总上下文必须是权威值，
+  `uncached = report_total - reported` 才一致；命中**比例**用同口径的模拟器算，避免跨
+  tokenizer 混用绝对值。
+- 计费完全自主可控、与上游真值解耦（用户决策）。floor=0 默认不造假；运营可调三参数。
+
+### Notes & Caveats
+
+- 对抗审查（GPT-5.4）：CRITICAL「跨口径混用」**已修**（同口径比例）。已知限制（未修，
+  危害在指纹修复后已小）：observe 在发上游前更新会话态，失败/重试请求会污染下轮 prev；
+  mult×cap 在长会话易撞 cap 退化成近似定值（参数可调）；merge_user_messages 连续 user
+  合并在边界场景仍可能跨轮文本不一致。
+- `cache_estimate.rs` 仅剩模块声明、无调用；`perceived_cache_hit_ratio` config 字段保留
+  兼容但不读；`affinity_promote_threshold`（v52 起废弃）前端标注「不再生效」。
+- 386 测试通过。必须 rebuild 生效。
+
 ## [v52] - 2026-06-03
 
 ### Fix —— 会话亲和「橡皮筋横跳」：落在哪个号就认哪个号
