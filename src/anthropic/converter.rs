@@ -521,21 +521,26 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         context = context.with_tool_results(validated_tool_results);
     }
 
-    // 12. 构建当前消息
-    // 兜底：仅当 text、tool_results、images、documents 全空时才占位（Kiro 判 400 Improperly formed request）。
-    // 注意：只在"彻底空"时兜底——"无文本但有 tool_results/document"是正常回合，
-    // 线上证据表明 Kiro 接受其空文本，绝不能注入占位符（否则污染每个回合）。
-    // 这种全空 user 回合极少见（通常是客户端异常）。
-    let content = if text_content.trim().is_empty()
-        && !has_tool_results
-        && images.is_empty()
-        && documents.is_empty()
-    {
+    // 12. 构建当前消息（content 兜底）
+    // Kiro 的 content 非空约束分两种情形：
+    //   - 带 image/document 但无文本 → **必须**补非空 content（实测纯 PDF/纯图无文本 → 400，
+    //     见 MEDIA_ONLY_PLACEHOLDER）。补一句引导语，让模型明确分析附件。
+    //   - text、tool_results、images、documents 全空 → 补单空格（纯空回合，客户端异常）。
+    //   - 无文本但有 tool_results（且无媒体）→ 正常工具结果回合，Kiro 接受空文本，不补（否则污染）。
+    let content = if !text_content.trim().is_empty() {
+        text_content
+    } else if !images.is_empty() || !documents.is_empty() {
+        tracing::warn!(
+            "当前 user 消息带媒体（image/document）但无文本，已补引导语占位以避免 Kiro 400"
+        );
+        MEDIA_ONLY_PLACEHOLDER.to_string()
+    } else if !has_tool_results {
         tracing::warn!(
             "当前 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
         EMPTY_CONTENT_PLACEHOLDER.to_string()
     } else {
+        // 仅有 tool_results（无媒体、无文本）：正常工具结果回合，保留空文本。
         text_content
     };
 
@@ -1006,6 +1011,17 @@ const TOOL_DESCRIPTION_MAX_LEN: usize = 10000;
 /// 选用单空格而非语义标记：避免污染对话内容，且与历史上"纯 tool_use"行为一致。
 const EMPTY_CONTENT_PLACEHOLDER: &str = " ";
 
+/// 媒体附件（image / document）无文本时的占位引导语。
+///
+/// 【实测根因 2026-06-03】Kiro 对"带 image/document 但 content 为空"的 user 消息
+/// 返回 400 "Improperly formed request"（用 38990 重放确诊：纯 PDF / 纯图像无文本均 400，
+/// 补任意非空文本即 200）。客户端（如某些 IDE 插件）只拖一个 PDF/图片、不附任何文字时，
+/// 转换后 content 为空 → 整个会话每轮确定性 400。
+///
+/// 与 `EMPTY_CONTENT_PLACEHOLDER`（单空格，用于纯空/纯 tool_use 回合）区分：这里用一句
+/// 中性英文引导语，既满足 Kiro 的非空要求，又能让模型明确"分析附件"这一意图、真正干活。
+const MEDIA_ONLY_PLACEHOLDER: &str = "Please analyze the attached file.";
+
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
@@ -1262,14 +1278,16 @@ fn merge_user_messages(
     }
 
     let content = content_parts.join("\n");
-    // 兜底：text + tool_results + images + documents 全空时，Kiro 会判 400 Improperly formed request。
-    // 注意只在"彻底空"时兜底——"无文本但有 tool_results/document"是正常回合，
-    // Kiro 接受其空文本，不能注入占位符（否则污染每个回合）。
-    let content = if content.trim().is_empty()
-        && all_tool_results.is_empty()
-        && all_images.is_empty()
-        && all_documents.is_empty()
-    {
+    // 兜底（与当前消息同规则）：带 image/document 无文本必须补引导语（Kiro 400）；
+    // 全空补单空格；仅 tool_results（无媒体）保留空文本。
+    let content = if !content.trim().is_empty() {
+        content
+    } else if !all_images.is_empty() || !all_documents.is_empty() {
+        tracing::warn!(
+            "历史 user 消息带媒体（image/document）但无文本，已补引导语占位以避免 Kiro 400"
+        );
+        MEDIA_ONLY_PLACEHOLDER.to_string()
+    } else if all_tool_results.is_empty() {
         tracing::warn!(
             "历史 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
@@ -1960,8 +1978,8 @@ mod tests {
     }
 
     #[test]
-    fn test_document_only_message_not_placeholdered() {
-        // 只有 document、无文本的 user 消息不应被当成"空"而注入占位符
+    fn test_document_converts_to_kiro_doc() {
+        // anthropic document 块正确转成 KiroDocument
         let src = super::super::types::ImageSource {
             source_type: "base64".to_string(),
             media_type: Some("application/pdf".to_string()),
@@ -1974,6 +1992,88 @@ mod tests {
         let doc = doc.unwrap();
         assert_eq!(doc.name, "report");
         assert_eq!(doc.format, "pdf");
+    }
+
+    #[test]
+    fn test_document_only_message_gets_media_placeholder() {
+        // 实测根因回归：纯 document、无文本的 user 消息，Kiro 要求 content 非空，
+        // 否则 400 Improperly formed request。converter 必须补 MEDIA_ONLY_PLACEHOLDER。
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="}}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let cm = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(cm.content, MEDIA_ONLY_PLACEHOLDER, "纯文档无文本应补引导语，不能留空");
+        assert_eq!(cm.documents.len(), 1, "文档应保留");
+    }
+
+    #[test]
+    fn test_image_only_message_gets_media_placeholder() {
+        // 同理：纯图像无文本也要补占位（实测纯图无文本 → Kiro 400）。
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let cm = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(cm.content, MEDIA_ONLY_PLACEHOLDER, "纯图像无文本应补引导语");
+        assert_eq!(cm.images.len(), 1, "图像应保留");
+    }
+
+    #[test]
+    fn test_document_with_text_keeps_text() {
+        // 带文本的文档消息：content 用用户文本，不覆盖成占位语。
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="}},
+                    {"type": "text", "text": "总结这个PDF"}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            context_management: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let cm = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(cm.content, "总结这个PDF", "有文本时保留用户文本");
     }
 
     #[test]
