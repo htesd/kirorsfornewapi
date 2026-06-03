@@ -398,15 +398,17 @@ pub(crate) async fn get_usage_limits(
 
 /// 会话亲和记录：session_key -> 选中的凭据（带 TTL 淘汰）
 ///
-/// 行为：home(primary) 健康时一直用 primary（缓存热）；primary 冷却/不可用时
-/// 走稳定 alt；alt 连续命中达阈值则转正为 primary（排空热账号）。
+/// 行为（v52 重写）：「落在哪个号就认哪个号」。primary 当下可用时一直用 primary
+/// （缓存热）；primary 不可用（busy/冷却/禁用）时**立即**改选一个 LRU 候选并把它
+/// 提交为新 primary —— 此后会话钉死在新号上，**永不主动迁回原号**。
+///
+/// 旧版（v3）维护 alt + alt_streak「延迟转正」：primary 一有空就弹回 primary 并清空
+/// alt 记忆，高并发下 primary 在「空↔满」抖动，会话便在「回 primary ↔ 每次新挑 alt」
+/// 间反复横跳，每跳一次冷一次 Kiro prefix cache（实测同一会话跨 4 个账号、命中率塌到
+/// 个位数百分比）。改为即时转正后，会话平滑迁移并稳定，不再橡皮筋式回弹。
 struct AffinityEntry {
-    /// 当前主账号
+    /// 当前主账号（落在哪个号就认哪个号；迁移后即更新，不回弹）
     primary: u64,
-    /// 临时次选（主账号冷却/不可用时使用，整个冷却期固定，保次选缓存）
-    alt: Option<u64>,
-    /// 次选连续命中次数（达到阈值则转正）
-    alt_streak: u32,
     /// 最后访问时间（用于 TTL 淘汰）
     last_access: Instant,
 }
@@ -778,15 +780,15 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// 按 session_key 做有状态会话亲和选号（v3）。
+    /// 按 session_key 做有状态会话亲和选号（v52：落在哪个号就认哪个号）。
     ///
     /// - 新会话：在合格凭据里按**优先级分层 LRU** 选 primary —— 先取最高优先级层
     ///   （priority 数值最小），层内再选 last_selected_at 最旧（最久未调用）者，写入映射。
-    /// - 老会话且 primary 健康：一直用 primary（缓存留在该账号，命中率最高）。
-    /// - primary 冷却/不可用：走稳定 alt（同样按分层 LRU 选，整个冷却期固定，保 alt 缓存）；
-    ///   alt 连续命中达 `affinity_promote_threshold` 次则转正为 primary —— 逐步排空热账号，
-    ///   避免所有会话反复抢同一个被限流的号。
-    /// - 映射按 `affinity_map_ttl_secs` 惰性淘汰。
+    /// - 老会话且 primary 当下可用：一直用 primary（缓存留在该账号，命中率最高）。
+    /// - primary 当下不可用（busy/冷却/禁用/不在允许集）：**立即**改选一个分层 LRU 候选，
+    ///   并**当场把它提交为新 primary** —— 会话从此钉在新号上，不再回弹到原号。
+    ///   这消除了旧版「primary 一有空就弹回、弹不回又每轮重挑」造成的跨账号橡皮筋横跳。
+    /// - 映射按 `affinity_map_ttl_secs` 惰性淘汰；TTL 过期等于会话重新开始，自然再平衡。
     ///
     /// 不可用（disabled/冷却中/不支持模型/busy）的凭据天然被滤掉。并发占满的账号已进
     /// `exclude`，故最高优先级层全忙时其成员离开合格集合，分层 LRU 的"最高层"自动下移到
@@ -844,10 +846,6 @@ impl MultiTokenManager {
                 .unwrap()
         };
 
-        let k = self
-            .affinity_promote_threshold
-            .load(Ordering::Relaxed)
-            .max(1);
         let ttl =
             StdDuration::from_secs(self.affinity_map_ttl_secs.load(Ordering::Relaxed).max(1));
         let now = Instant::now();
@@ -858,13 +856,12 @@ impl MultiTokenManager {
 
             match map.get_mut(session_key) {
                 None => {
+                    // 新会话：分层 LRU 选 primary，写入映射
                     let id = lru_id(&eligible_ids);
                     map.insert(
                         session_key.to_string(),
                         AffinityEntry {
                             primary: id,
-                            alt: None,
-                            alt_streak: 0,
                             last_access: now,
                         },
                     );
@@ -873,24 +870,14 @@ impl MultiTokenManager {
                 Some(ent) => {
                     ent.last_access = now;
                     if eligible_ids.contains(&ent.primary) {
-                        // home 健康 → 用 primary，丢弃临时 alt
-                        ent.alt = None;
-                        ent.alt_streak = 0;
+                        // primary 当下可用 → 继续用（缓存热，命中率最高）
                         ent.primary
                     } else {
-                        // home 冷却/不可用 → 稳定次选
-                        if ent.alt.map(|a| !eligible_ids.contains(&a)).unwrap_or(true) {
-                            ent.alt = Some(lru_id(&eligible_ids));
-                        }
-                        ent.alt_streak = ent.alt_streak.saturating_add(1);
-                        let alt = ent.alt.unwrap();
-                        if ent.alt_streak >= k {
-                            // 次选连续命中达阈值 → 转正，排空热账号
-                            ent.primary = alt;
-                            ent.alt = None;
-                            ent.alt_streak = 0;
-                        }
-                        alt
+                        // primary 当下不可用（busy/冷却/禁用/不在允许集）→ 立即改选并转正。
+                        // 「落在哪个号就认哪个号」：新号即刻成为 primary，此后不回弹原号。
+                        let id = lru_id(&eligible_ids);
+                        ent.primary = id;
+                        id
                     }
                 }
             }
@@ -2414,11 +2401,18 @@ impl MultiTokenManager {
     }
 
     /// 获取会话亲和"次选转正"阈值 K（Admin API）
+    ///
+    /// **v52 起废弃**：选号已改为「primary 不可用即立即转正」（等效 K=1），本值不再
+    /// 参与选号决策。保留 getter/setter/配置字段仅为向后兼容（避免旧 config.json 与
+    /// Admin UI 报错）。调整它对调度行为无任何影响。
     pub fn get_affinity_promote_threshold(&self) -> u32 {
         self.affinity_promote_threshold.load(Ordering::Relaxed)
     }
 
     /// 设置会话亲和"次选转正"阈值 K（Admin API，clamp 到 [1,20]）
+    ///
+    /// **v52 起废弃**：见 [`Self::get_affinity_promote_threshold`]。仍持久化以兼容，
+    /// 但选号逻辑不读取该值。
     pub fn set_affinity_promote_threshold(&self, k: u32) -> anyhow::Result<()> {
         let k = k.clamp(1, 20);
         let previous = self.get_affinity_promote_threshold();
@@ -3103,17 +3097,16 @@ mod tests {
     }
 
     #[test]
-    fn session_affinity_promotes_alt_after_threshold() {
-        // v3：primary 持续不可用（busy），次选连续命中达 K 次后转正为 primary
+    fn session_affinity_promotes_alt_immediately_when_primary_unavailable() {
+        // v52：primary 一旦当下不可用（busy），立即改选并把新号转正为 primary，
+        // 此后即使原 primary 恢复也不回弹（落在哪个号就认哪个号，消除橡皮筋横跳）。
         let mut creds = vec![];
         for i in 0..3 {
             let mut c = KiroCredentials::default();
             c.refresh_token = Some(format!("token{}", i));
             creds.push(c);
         }
-        let mut config = Config::default();
-        config.affinity_promote_threshold = 3;
-        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+        let manager = MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
 
         // 建立映射，拿到 primary
         let primary = manager
@@ -3123,21 +3116,19 @@ mod tests {
         let mut busy = std::collections::HashSet::new();
         busy.insert(primary);
 
-        // primary busy 期间，连续命中次选；达 K=3 后次选转正
-        let mut alt = 0;
-        for _ in 0..3 {
-            alt = manager
-                .select_by_session_affinity(None, "conv-p", &busy, None)
-                .unwrap()
-                .0;
-            assert_ne!(alt, primary);
-        }
-        // 此后即使 primary 重新可用（busy 清空），也应继续用已转正的 alt
-        let after_promote = manager
+        // primary busy → 立即改选一个非 primary 的号
+        let alt = manager
+            .select_by_session_affinity(None, "conv-p", &busy, None)
+            .unwrap()
+            .0;
+        assert_ne!(alt, primary, "primary busy 时应改选其他号");
+
+        // 关键：原 primary 恢复可用（busy 清空），仍应继续用已转正的 alt，不回弹
+        let after = manager
             .select_by_session_affinity(None, "conv-p", &std::collections::HashSet::new(), None)
             .unwrap()
             .0;
-        assert_eq!(after_promote, alt, "次选连续命中 K 次后应转正为 primary");
+        assert_eq!(after, alt, "迁移后应钉在新号上，永不主动迁回原 primary");
     }
 
     #[test]

@@ -1,5 +1,45 @@
 # Changelog
 
+## [v52] - 2026-06-03
+
+### Fix —— 会话亲和「橡皮筋横跳」：落在哪个号就认哪个号
+
+**现象**：用户 ligo04 单会话扣费畸高，125k prompt 只命中 3k–30k cache_read。抓报文确诊：
+同一 `conversationId`（79c905ca…）19 秒内被路由到 kiro-25→23→25→26→28 **四个上游账号**。
+Kiro prefix cache 按账号隔离，每切一次号≈冷启动，命中率塌到个位数百分比。
+
+**根因**：`select_by_session_affinity`（v3 逻辑）给每个会话钉死一个固定 `primary`：
+- primary 当下有空槽 → 回 primary，并**清空** alt 记忆（`ent.alt=None`）；
+- primary 当下满 → 临时挑 LRU alt，但要连续命中 `affinity_promote_threshold`（默认 3）次
+  才转正，且 primary 中途空一次就 streak 清零、alt 记忆又被清。
+
+高并发下 primary（热点号）在「空↔满」抖动，会话便在「回 primary ↔ 每轮新挑一个 alt」
+间反复横跳，每跳一次冷一次缓存。"现在用的人多"把这个固有缺陷放大成线上事故。
+
+**修复**：重写为「落在哪个号就认哪个号」——
+- primary 当下可用 → 继续用（不变）；
+- primary 不可用（busy/冷却/禁用/不在允许集）→ **立即**改选一个分层 LRU 候选并**当场
+  转正为新 primary**，此后钉死在新号、**永不主动迁回原号**（用户决策）。
+- `AffinityEntry` 删去 `alt`/`alt_streak` 字段，结构与逻辑同步简化。
+
+### Design Rationale
+
+- **为何即时转正而非等待 primary 释放**：opus 单号并发上限 2、同会话请求基本串行，
+  primary 满几乎总意味着别的会话也钉在此号（真实争用）。死等会徒增延迟且加剧热点；
+  即时迁移到空闲号 + 永久转正 = 负载自然扩散 + 之后稳定。迁移只冷一次缓存，旧逻辑每轮都冷。
+- **为何永不迁回**：迁回 = 再冷一次 + 重新具备横跳条件。钉死新号最大化缓存稳定；负载
+  再平衡交给 TTL 过期（会话自然重开）与新会话的 LRU 分配。
+- `affinity_promote_threshold` 配置项/Admin 接口**保留但标注废弃**（等效恒为 1），不读其值
+  —— 避免删字段破坏旧 config.json 与 Admin UI 兼容。
+
+### Notes & Caveats
+
+- 本缺陷源自 commit `5727ef4`（早于 v48 缓存模拟器），非 v48–v51 引入；与历史 thinking
+  剥离（v49）无关——后者只动历史侧、不影响响应 thinking，用户最初的「thinking 不可见」
+  系误判，已排除。
+- 必须 rebuild 生效（选号在编译期逻辑里，非热调参数）。用户确认下班时段重建可接受。
+- 亲和单元测试 8 项全过（含新增「primary 不可用即时转正、恢复后不回弹」回归）；全量 381 通过。
+
 ## [v51] - 2026-06-03
 
 ### Refactor —— 配置抽取：散落硬编码参数收口到 config.json 分组对象
