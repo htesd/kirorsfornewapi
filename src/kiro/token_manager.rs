@@ -155,7 +155,7 @@ async fn refresh_social_token(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, config.credential.refresh_timeout_secs, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -251,7 +251,7 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, config.credential.refresh_timeout_secs, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -357,7 +357,7 @@ pub(crate) async fn get_usage_limits(
         kiro_version, machine_id
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, config.credential.refresh_timeout_secs, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
@@ -564,12 +564,16 @@ pub struct MultiTokenManager {
     affinity_map_ttl_secs: AtomicU64,
     /// 用户感知缓存命中放大比例（None=不放大；运行时可调，作用于响应 usage 上报）
     perceived_cache_hit_ratio: Mutex<Option<f64>>,
+    /// 缓存上报锚定放大倍率（运行时可调，config.cache.readMultiplier）。
+    /// 用 AtomicU64 存 f64 bits（无原子 f64），读写经 from_bits/to_bits。
+    cache_read_multiplier_bits: AtomicU64,
+    /// metering 反推命中判定阈值（运行时可调，config.cache.hitThreshold）。同上以 bits 存。
+    cache_hit_threshold_bits: AtomicU64,
 }
 
-/// 每个凭据最大 API 调用失败次数
-const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// 每个凭据最大并发请求数（超过则跳过选下一个号）
-const MAX_CONCURRENCY_PER_CREDENTIAL: usize = 2;
+// 凭据失败/并发上限已迁出为 config.json 的 `credential` 组
+// （见 model::tuning::CredentialConfig）。下方方法从 self.config.credential 读取
+// （冷读：启动时确定）。STATS_SAVE_DEBOUNCE 仍为内部实现常量。
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -648,7 +652,7 @@ impl MultiTokenManager {
                     semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                         cred.max_concurrency
                             .map(|n| n as usize)
-                            .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL),
+                            .unwrap_or(config.credential.max_concurrency),
                     )),
                 }
             })
@@ -702,6 +706,12 @@ impl MultiTokenManager {
         let perceived_cache_hit_ratio = config
             .perceived_cache_hit_ratio
             .map(|r| r.clamp(0.0, 1.0));
+        // 缓存倍率 / 命中阈值初值来自 config.cache
+        let cache_read_multiplier = config.cache.read_multiplier;
+        let cache_hit_threshold = config.cache.hit_threshold;
+        // 把 cache_sim 全局单例的 TTL / 容量同步为 config.cache 值（运行时可再热调）
+        crate::kiro::cache_sim::global().set_ttl_secs(config.cache.sim_ttl_secs);
+        crate::kiro::cache_sim::global().set_max_sessions(config.cache.max_sessions);
         let manager = Self {
             config,
             proxy,
@@ -718,6 +728,8 @@ impl MultiTokenManager {
             affinity_promote_threshold: AtomicU32::new(affinity_promote_threshold),
             affinity_map_ttl_secs: AtomicU64::new(affinity_map_ttl_secs),
             perceived_cache_hit_ratio: Mutex::new(perceived_cache_hit_ratio),
+            cache_read_multiplier_bits: AtomicU64::new(cache_read_multiplier.to_bits()),
+            cache_hit_threshold_bits: AtomicU64::new(cache_hit_threshold.to_bits()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -738,6 +750,20 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Token 是否已过期（按 config.credential.token_expiry_margin_secs 提前量判断）。
+    /// 无法解析过期时间时按"已过期"（true）保守处理，与 is_token_expired 一致。
+    fn cred_expired(&self, credentials: &KiroCredentials) -> bool {
+        let margin_min = (self.config.credential.token_expiry_margin_secs as i64) / 60;
+        is_token_expiring_within(credentials, margin_min).unwrap_or(true)
+    }
+
+    /// Token 是否即将过期（按 config.credential.token_expiring_soon_secs 窗口判断）。
+    /// 无法解析时按"未即将过期"（false），与 is_token_expiring_soon 一致。
+    fn cred_expiring_soon(&self, credentials: &KiroCredentials) -> bool {
+        let window_min = (self.config.credential.token_expiring_soon_secs as i64) / 60;
+        is_token_expiring_within(credentials, window_min).unwrap_or(false)
     }
 
     /// 获取凭据总数
@@ -986,7 +1012,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         let allowed = allowed_group.as_ref();
         let total = self.total_count();
-        let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
+        let max_attempts = (total * self.config.credential.max_failures as usize).max(1);
         let mut attempt_count = 0;
         // 会话亲和只在第一次 attempt 应用；失败后降级走原逻辑，避免死循环
         let mut session_affinity_tried = false;
@@ -1136,7 +1162,7 @@ impl MultiTokenManager {
                 Some(sem) => match sem.clone().try_acquire_owned() {
                     Ok(p) => std::sync::Arc::new(p),
                     Err(_) => {
-                        tracing::debug!("凭据 #{} 并发已满（{}），跳过", id, MAX_CONCURRENCY_PER_CREDENTIAL);
+                        tracing::debug!("凭据 #{} 并发已满（{}），跳过", id, self.config.credential.max_concurrency);
                         busy_ids.insert(id);
                         attempt_count += 1;
                         // 重新允许 session affinity 在 busy 被释放后重试（如果 busy 集合清空了）
@@ -1228,7 +1254,7 @@ impl MultiTokenManager {
         }
 
         // 第一次检查（无锁）：快速判断是否需要刷新
-        let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        let needs_refresh = self.cred_expired(credentials) || self.cred_expiring_soon(credentials);
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
@@ -1244,13 +1270,13 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
             };
 
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+            if self.cred_expired(&current_creds) || self.cred_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
-                if is_token_expired(&new_creds) {
+                if self.cred_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                 }
 
@@ -1479,6 +1505,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        let max_failures = self.config.credential.max_failures;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1500,10 +1527,10 @@ impl MultiTokenManager {
                 "凭据 #{} API 调用失败（{}/{}）",
                 id,
                 failure_count,
-                MAX_FAILURES_PER_CREDENTIAL
+                max_failures
             );
 
-            if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+            if failure_count >= max_failures {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
@@ -1555,7 +1582,7 @@ impl MultiTokenManager {
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.failure_count = self.config.credential.max_failures;
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
@@ -1644,6 +1671,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        let max_failures = self.config.credential.max_failures;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1665,10 +1693,10 @@ impl MultiTokenManager {
                 "凭据 #{} Token 刷新失败（{}/{}）",
                 id,
                 refresh_failure_count,
-                MAX_FAILURES_PER_CREDENTIAL
+                max_failures
             );
 
-            if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
+            if refresh_failure_count < max_failures {
                 return entries.iter().any(|e| !e.disabled);
             }
 
@@ -1845,11 +1873,11 @@ impl MultiTokenManager {
                     max_concurrency: e
                         .credentials
                         .max_concurrency
-                        .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL as u32),
+                        .unwrap_or(self.config.credential.max_concurrency as u32),
                     in_flight: (e
                         .credentials
                         .max_concurrency
-                        .unwrap_or(MAX_CONCURRENCY_PER_CREDENTIAL as u32))
+                        .unwrap_or(self.config.credential.max_concurrency as u32))
                     .saturating_sub(e.semaphore.available_permits() as u32),
                 })
                 .collect(),
@@ -1965,7 +1993,7 @@ impl MultiTokenManager {
         } else {
             // 检查是否需要刷新 token
             let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+                self.cred_expired(&credentials) || self.cred_expiring_soon(&credentials);
 
             if needs_refresh {
                 let _guard = self.refresh_lock.lock().await;
@@ -1978,7 +2006,7 @@ impl MultiTokenManager {
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
                 };
 
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                if self.cred_expired(&current_creds) || self.cred_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
@@ -2175,7 +2203,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 last_selected_at: None,
-                semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY_PER_CREDENTIAL)),
+                semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(self.config.credential.max_concurrency)),
             });
         }
 
@@ -2455,6 +2483,84 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 缓存上报锚定放大倍率（live 值；请求路径读，>0）。
+    pub fn get_cache_read_multiplier(&self) -> f64 {
+        f64::from_bits(self.cache_read_multiplier_bits.load(Ordering::Relaxed))
+    }
+
+    /// 设置缓存上报锚定放大倍率（Admin API；下界 0.0，<=0 由 inflate 回退默认）。
+    pub fn set_cache_read_multiplier(&self, multiplier: f64) -> anyhow::Result<()> {
+        let m = multiplier.max(0.0);
+        let previous = self.get_cache_read_multiplier();
+        if previous == m {
+            return Ok(());
+        }
+        self.cache_read_multiplier_bits.store(m.to_bits(), Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.cache.read_multiplier = m) {
+            self.cache_read_multiplier_bits.store(previous.to_bits(), Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("缓存上报放大倍率已设置为: {:.4}", m);
+        Ok(())
+    }
+
+    /// metering 反推命中判定阈值（live 值；末级估算兜底读）。
+    pub fn get_cache_hit_threshold(&self) -> f64 {
+        f64::from_bits(self.cache_hit_threshold_bits.load(Ordering::Relaxed))
+    }
+
+    /// 设置 metering 反推命中判定阈值（Admin API）。
+    pub fn set_cache_hit_threshold(&self, threshold: f64) -> anyhow::Result<()> {
+        let t = threshold.max(0.0);
+        let previous = self.get_cache_hit_threshold();
+        if previous == t {
+            return Ok(());
+        }
+        self.cache_hit_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
+        if let Err(err) = self.persist_config_field(|c| c.cache.hit_threshold = t) {
+            self.cache_hit_threshold_bits.store(previous.to_bits(), Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("缓存命中判定阈值已设置为: {:.4}", t);
+        Ok(())
+    }
+
+    /// 缓存模拟器 TTL（秒，live 值——读 cache_sim 全局单例的权威值）。
+    pub fn get_cache_sim_ttl_secs(&self) -> u64 {
+        crate::kiro::cache_sim::global().ttl_secs()
+    }
+
+    /// 设置缓存模拟器 TTL（秒，Admin API）。先热更新单例，持久化失败则回滚单例。
+    pub fn set_cache_sim_ttl_secs(&self, secs: u64) -> anyhow::Result<()> {
+        let secs = secs.max(1);
+        let previous = crate::kiro::cache_sim::global().ttl_secs();
+        crate::kiro::cache_sim::global().set_ttl_secs(secs);
+        if let Err(err) = self.persist_config_field(|c| c.cache.sim_ttl_secs = secs) {
+            crate::kiro::cache_sim::global().set_ttl_secs(previous);
+            return Err(err);
+        }
+        tracing::info!("缓存模拟器 TTL 已设置为: {}s", secs);
+        Ok(())
+    }
+
+    /// 缓存模拟器最大会话数（live 值——读 cache_sim 全局单例的权威值）。
+    pub fn get_cache_max_sessions(&self) -> usize {
+        crate::kiro::cache_sim::global().max_sessions_value()
+    }
+
+    /// 设置缓存模拟器最大会话数（Admin API）。先热更新单例，持久化失败则回滚单例。
+    pub fn set_cache_max_sessions(&self, n: usize) -> anyhow::Result<()> {
+        let n = n.max(1);
+        let previous = crate::kiro::cache_sim::global().max_sessions_value();
+        crate::kiro::cache_sim::global().set_max_sessions(n);
+        if let Err(err) = self.persist_config_field(|c| c.cache.max_sessions = n) {
+            crate::kiro::cache_sim::global().set_max_sessions(previous);
+            return Err(err);
+        }
+        tracing::info!("缓存模拟器最大会话数已设置为: {}", n);
+        Ok(())
+    }
+
     /// 通用：重新加载配置文件、应用一处修改、回写（用于运行时可调参数持久化）
     fn persist_config_field<F: FnOnce(&mut Config)>(&self, apply: F) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -2486,6 +2592,10 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用：凭据失败上限默认值（= CredentialConfig::default().max_failures）。
+    /// 这些测试构造的 manager 用默认 config，故沿用默认值断言。
+    const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 
     #[test]
     fn test_is_token_expired_with_expired_token() {

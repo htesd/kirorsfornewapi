@@ -27,6 +27,9 @@ pub struct CountTokensConfig {
     pub proxy: Option<ProxyConfig>,
 
     pub tls_backend: TlsBackend,
+
+    /// 远程 count_tokens API 的 HTTP 超时（秒，0 → 回退默认 300）
+    pub timeout_secs: u64,
 }
 
 /// 全局配置存储
@@ -146,7 +149,8 @@ async fn call_remote_count_tokens(
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    let timeout = if config.timeout_secs == 0 { 300 } else { config.timeout_secs };
+    let client = build_client(config.proxy.as_ref(), timeout, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {

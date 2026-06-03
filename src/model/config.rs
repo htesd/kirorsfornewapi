@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::db::RequestLogConfig;
+use crate::model::tuning::{CacheConfig, CredentialConfig, RetryConfig};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +139,18 @@ pub struct Config {
     #[serde(default)]
     pub request_log: RequestLogConfig,
 
+    /// 缓存模拟 / 计费可调参数（运行时可热调）。详见 [`CacheConfig`]。
+    #[serde(default)]
+    pub cache: CacheConfig,
+
+    /// 上游重试 / 退避 / 超时参数（启动时读）。详见 [`RetryConfig`]。
+    #[serde(default)]
+    pub retry: RetryConfig,
+
+    /// 凭据并发 / 失败 / token 刷新参数（启动时读）。详见 [`CredentialConfig`]。
+    #[serde(default)]
+    pub credential: CredentialConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -230,6 +243,9 @@ impl Default for Config {
             endpoints: HashMap::new(),
             perceived_cache_hit_ratio: None,
             request_log: RequestLogConfig::default(),
+            cache: CacheConfig::default(),
+            retry: RetryConfig::default(),
+            credential: CredentialConfig::default(),
             config_path: None,
         }
     }

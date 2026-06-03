@@ -19,11 +19,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
-
-/// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+// 重试 / 退避 / 超时参数已迁出为 config.json 的 `retry` 组（见 model::tuning::RetryConfig）。
+// 这些值改造前是 provider 内的硬编码 const，现统一从 token_manager.config().retry 读取
+// （冷读：启动时确定，运行时改需重启）。
 
 /// API 调用成功后的输出
 ///
@@ -129,8 +127,9 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        let api_timeout = token_manager.config().retry.api_timeout_secs;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
+        let initial_client = build_client(proxy.as_ref(), api_timeout, tls_backend)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
@@ -153,6 +152,16 @@ impl KiroProvider {
         self.token_manager.get_perceived_cache_hit_ratio()
     }
 
+    /// 当前生效的缓存上报放大倍率（运行时可调，读 token_manager live 值）
+    pub fn cache_read_multiplier(&self) -> f64 {
+        self.token_manager.get_cache_read_multiplier()
+    }
+
+    /// 当前生效的 metering 命中判定阈值（运行时可调）
+    pub fn cache_hit_threshold(&self) -> f64 {
+        self.token_manager.get_cache_hit_threshold()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -160,7 +169,8 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let api_timeout = self.token_manager.config().retry.api_timeout_secs;
+        let client = build_client(effective.as_ref(), api_timeout, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -222,7 +232,9 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let retry_cfg = self.token_manager.config().retry;
+        let max_retries = (total_credentials * retry_cfg.max_retries_per_credential as usize)
+            .min(retry_cfg.max_total_retries as usize);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -278,7 +290,7 @@ impl KiroProvider {
                     );
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        sleep(self.retry_delay(attempt)).await;
                     }
                     continue;
                 }
@@ -342,7 +354,7 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    sleep(self.retry_delay(attempt)).await;
                 }
                 continue;
             }
@@ -355,7 +367,7 @@ impl KiroProvider {
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
+                sleep(self.retry_delay(attempt)).await;
             }
         }
 
@@ -377,7 +389,9 @@ impl KiroProvider {
         allowed_group: Option<std::collections::HashSet<u64>>,
     ) -> anyhow::Result<CallOutcome> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let retry_cfg = self.token_manager.config().retry;
+        let max_retries = (total_credentials * retry_cfg.max_retries_per_credential as usize)
+            .min(retry_cfg.max_total_retries as usize);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -453,7 +467,7 @@ impl KiroProvider {
                         format!("API 请求发送失败: {}", e),
                     ));
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        sleep(self.retry_delay(attempt)).await;
                     }
                     continue;
                 }
@@ -618,7 +632,7 @@ impl KiroProvider {
                     format!("{} API 请求失败: {} {}", api_type, status, body),
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    sleep(self.retry_delay(attempt)).await;
                 }
                 continue;
             }
@@ -648,7 +662,7 @@ impl KiroProvider {
                 format!("{} API 请求失败: {} {}", api_type, status, body),
             ));
             if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
+                sleep(self.retry_delay(attempt)).await;
             }
         }
 
@@ -691,12 +705,13 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
-    fn retry_delay(attempt: usize) -> Duration {
-        // 指数退避 + 少量抖动，避免上游抖动时放大故障
-        const BASE_MS: u64 = 200;
-        const MAX_MS: u64 = 2_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
+    fn retry_delay(&self, attempt: usize) -> Duration {
+        // 指数退避 + 少量抖动，避免上游抖动时放大故障。基础/上限来自 config.retry。
+        let retry_cfg = self.token_manager.config().retry;
+        let base_ms = retry_cfg.backoff_base_ms.max(1);
+        let max_ms = retry_cfg.backoff_max_ms.max(base_ms);
+        let exp = base_ms.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(max_ms);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))

@@ -172,6 +172,8 @@ async fn main() {
         auth_type: config.count_tokens_auth_type.clone(),
         proxy: proxy_config,
         tls_backend: config.tls_backend,
+        // 0 → token.rs 回退默认 300s；当前不暴露单独配置项（够用即可）
+        timeout_secs: 0,
     });
 
     // 启动请求日志 writer（按配置开关）
