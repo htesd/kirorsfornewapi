@@ -1,5 +1,31 @@
 # Changelog
 
+## [v54] - 2026-06-03
+
+### Fix —— 带 image/document 无文本补引导语占位（修复纯 PDF/纯图 Kiro 400）
+
+**现象**：用户只拖一个 PDF（或图片）、不附任何文字 → 整个会话每轮确定性
+400 "Improperly formed request"（同一请求被反代重试 9 次全失败）。
+
+**根因（38990 重放确诊）**：Kiro 要求带 image/document 的 user 消息必须有非空
+content。实测：纯 PDF / 纯图无文本均 400；document/image + 任意非空文本即 200；纯文本 200。
+旧 converter 兜底逻辑只在 text+tool_results+images+documents **全空**时才补占位符，
+「有 document/image 但 text 空」被当正常回合放过 → content 留空 → 400。
+（旧注释还误称「Kiro 接受带 document 的空文本」，已被实测证伪。）
+
+**修复**：`convert_request` 当前消息 + `merge_user_messages` 历史侧，统一三分支兜底：
+- 带 image/document 无文本 → 补 `MEDIA_ONLY_PLACEHOLDER`（"Please analyze the
+  attached file."，让模型明确分析附件、真正干活）
+- 全空（无 text/tool_result/media）→ 补单空格 `EMPTY_CONTENT_PLACEHOLDER`
+- 仅 tool_results 无媒体 → 保留空文本（正常工具结果回合，Kiro 接受，注入反污染）
+
+### Notes & Caveats
+
+- 新增 3 回归测试（纯 doc/纯图/带文本），389 测试通过。
+- 部署后 38990 重放验证：原故障 PDF → 200 有输出；有效图无文本 → 200。
+- 踩坑：测图像用 1x1 像素 PNG 会被 Kiro 拒（图像本身无效，非 content 问题），
+  误导诊断；测试需用有效尺寸图。
+
 ## [v53] - 2026-06-03
 
 ### Fix + Refactor —— 缓存计费统一走模拟器：修指纹崩盘 + 同口径比例上报 + 三参数热调
