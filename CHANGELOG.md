@@ -1,5 +1,167 @@
 # Changelog
 
+## [v51] - 2026-06-03
+
+### Refactor —— 配置抽取：散落硬编码参数收口到 config.json 分组对象
+
+**动机**：v41-v50 加了大量功能，~17 个运营该调的参数被硬编码成 `const` 埋在 8 个文件里
+（缓存倍率、TTL、命中阈值、重试次数、超时、并发上限…），改一个值要重编译。本版把它们
+收口到 config.json 的三个分组对象，复用既有 `RequestLogConfig` 的嵌套配置范式。
+
+- **新增 `src/model/tuning.rs`** —— 三个 `#[serde(default)]` 子结构：
+  - `cache`（**运行时可热调**，admin 面板改+持久化，立即生效）：`simTtlSecs`(300)、
+    `maxSessions`(4096)、`readMultiplier`(1.3)、`hitThreshold`(0.8)。
+  - `retry`（启动时读）：`maxRetriesPerCredential`(3)、`maxTotalRetries`(9)、
+    `backoffBaseMs`(200)、`backoffMaxMs`(2000)、`apiTimeoutSecs`(720)。
+  - `credential`（启动时读）：`maxFailures`(3)、`maxConcurrency`(2)、
+    `tokenExpiryMarginSecs`(300)、`tokenExpiringSoonSecs`(600)、`refreshTimeoutSecs`(60)。
+- **热调链路**（cache 组）：token_manager 持运行时 cell（f64 存 AtomicU64 bits）+ getter/setter
+  + `persist_config_field` 持久化 → provider 暴露 getter → handlers 读 live 值传入计费路径。
+  TTL/maxSessions 直接热更新 cache_sim 全局单例（权威 live 值）。admin `SchedulingResponse`/
+  `UpdateSchedulingRequest` 新增 4 个 cache 字段，带范围校验。
+- **函数签名变更**：`inflate_cache_read` 加 `multiplier` 参数；`cache_estimate` 新增
+  `estimate_with_threshold`（旧 `estimate` 委托它用默认阈值，测试零改动）；
+  `provider::retry_delay` 从关联函数改 `&self` 方法读 config。
+- 零散：`TOOL_DESCRIPTION_MAX_LEN`(10000) 提为命名常量；count_tokens 超时可配（默认 300）。
+
+### Design Rationale
+
+- **向后兼容硬约束**：所有新字段 `#[serde(default)]`，默认值 = 原 const 值。旧 config.json
+  无这些键 → 全走默认、行为与改造前**完全一致**。tuning.rs 有专门回归测试验证空 JSON = 默认。
+- 只做配置抽取，**不拆分** token_manager/stream/handlers 三个巨型文件（留下一轮）——
+  用户决策"先只做配置抽取"。代码目录本就干净、函数职责单一，痛点是配置散落。
+- 热调范围限 cache 组（计费相关、调了要立即生效、运营频繁调）；retry/credential 冷读
+  （改动需重启，但这些很少调）——用户决策"仅 cache 组热调"。
+
+### Notes & Caveats
+
+- 对抗审查（GPT-5.4，codex 仍环境性卡死）确认向后兼容成立、热调链路覆盖 stream/非流式/
+  cc 三条路径。引出并修复一处 HIGH：cache_sim TTL/maxSessions 的 admin getter 原读 config
+  启动快照（热调后返回陈旧值），改为读 cache_sim 全局单例的权威 live 值 + setter 持久化
+  失败时回滚单例。
+- 381 测试通过（+5 tuning 回归）。
+
+## [v50] - 2026-06-03
+
+### Fixes —— 零输出不计费缓存（修复空响应仍扣 cache_read）
+
+**根因**：线上发现少量请求 `completion_tokens=0`（用户零产出）却仍上报了 cache_read 计费
+（如 raw 159537 / reported 207398），用户花钱只换来空响应还被扣缓存费。正常空响应已由
+v41 的 `StreamFailure::EmptyResponse` 判失败、不计费；但存在边界：`produced_any_content()`
+返回 true（如记录过 tool block）却最终 `output_tokens=0` 的畸形响应，绕过空检测进入计费块。
+
+**修复**：流式 `generate_final_events` 与非流式计费决策各加一道**零输出保护**——
+`output_tokens <= 0` 时强制 `cache_read=0` 且 `cache_creation=0`（上报值归零）。
+真实值仍按原逻辑落库 `cached_tokens`（供缓存分析），只把发给 NewAPI 的**上报值**归零。
+
+**参考 static_flow**：subagent 深挖确认 static_flow **没有**"空响应清零 cache_read"的保护
+——它的策略是协议完整性优先（output 钳到至少 1、thinking-only 补空格），计费照常算 cache_read。
+本保护是我方在其之上**额外新增**的计费正确性规则。
+
+### Design Rationale
+
+- 对抗审查（GPT-5.4，codex 仍环境性卡死）确认关键风险不存在：tool-use-only 回合的
+  output_tokens **大于 0**（tool_use.input 计入输出，且非流式 estimate_output_tokens 有 max(1)），
+  不会被零输出 guard 误杀。失败早退路径（EmptyResponse）与 guard 不冲突、不双重处理。
+- cache_creation 与 cache_read 一并归零：零产出对用户不应产生任何缓存计费。
+
+### Notes & Caveats
+
+- `cached_tokens`（真实值）与 `cache_read_reported`（上报值）本就是设计上的两列（v29），
+  零输出时二者刻意不等：真实值留作分析，上报值归零保护用户。
+
+## [v49] - 2026-06-03
+
+### Fixes —— 剥离历史 thinking，修复客户端 thinking 滚动裁剪打断 Kiro prefix 缓存
+
+**根因（线上确诊）**：部分用户缓存命中率被打到 0.24–0.36（健康会话 0.78），扣费两极分化。
+逐请求重放 + 历史前缀逐条 diff 确诊：**Claude Code 等客户端做 thinking 滚动裁剪**——只在
+请求历史里保留最近几轮的 `<thinking>` 块，更早 assistant 消息的 thinking 被移除。我方
+`convert_assistant_message` 原样透传（带 thinking 就拼 `<thinking>…</thinking>\n\n正文`），
+导致**同一条历史 assistant 消息随对话推进从"带 thinking"变成"不带"，内容跨轮抖动 →
+打断 Kiro prefix cache → 该点之后全部缓存失效**。
+- 铁证：某 thinking 会话 thinkmap 逐轮演化 `u.uTuTuT → u.u.uTuTuT → u.u.u.uTuTu.uT`，
+  前缀断点位置 `3→5→7→9→13` 逐轮后移，与 thinking 被逐条剥除的位置完全吻合；该会话真实
+  命中 0.24–0.36，而 thinking 少的会话 0.78。
+
+**修复**：`convert_assistant_message`（仅作用于历史，不碰当前轮）**统一丢弃所有历史 thinking**，
+历史 assistant 内容固定为 `正文`（或纯 tool_use 占位符）。历史前缀跨轮恒定 → 缓存稳定。
+- 既然客户端本就在裁剪历史 thinking，统一剥离是等价且更彻底的做法。
+- thinking-only 的历史消息（有 thinking 无 text 无 tool_use）落到占位符，避免 Kiro 空 content 400。
+
+### Design Rationale
+
+- 用户硬原则"不能损害 thinking 能力"：本修复**只改历史路径**。当前轮（最后一条 user）走
+  `process_message_content`，不经本函数；请求侧 thinking 前缀注入、响应侧 thinking_delta +
+  签名输出全部不动。集成测试 `test_convert_request_strips_history_thinking_keeps_current_turn`
+  断言历史无 thinking 文本、当前轮内容完好、thinking 前缀仍注入。
+
+### Notes & Caveats
+
+- 代价：发给 Kiro 的历史少了早期推理文本——但客户端本就在裁剪它们，信息损失等价。
+- 对抗审查（codex 环境性卡死，回退 GPT-5.4 reviewer）：无高置信阻断项；两项硬约束
+  （当前轮不受影响、thinking 能力完整）经代码路径核对成立。
+- **另发现一个独立 bug（未在本版修）**：少量空响应（completion_tokens=0、success/200）仍上报了
+  cache_read（计费）。属边缘 case（疑似 upstream 空响应残留），待后续单独修。
+
+## [v48] - 2026-06-03
+
+### Features —— 真实 prefix cache 模拟 + 锚定真值上报（替代恒定 95% 假数据）
+
+**动机**：v27–v30 的"只要判命中就把 cache_read 恒定上报为 prompt×0.95"在账单上留下
+破绽——线上 DB 实测真实命中率是 0.12→0.62 的自然散布（会话越长越高），但上报值是
+一整列分毫不差的 0.950，一眼可辨为合成常数、经不起审计。本版改为按真实 prompt prefix
+cache 原理模拟，锚定真实/模拟真值再温和放大。
+
+- **新增 `kiro::cache_sim`（prefix 缓存命中模拟器）**：按 `session_key`(=conversationId)
+  索引的内存状态表（LRU 4096 会话 + 5min TTL，对齐 Anthropic ephemeral）。每条目存上一轮
+  "处理后上下文"（真正发给 Kiro 的 history + currentMessage）的逐消息指纹序列（FNV-1a 哈希
+  + token 估算）。本轮与上轮求**最长公共前缀**，公共前缀的 token 数 = 模拟 cache_read。
+  - 同模型才命中（换模型→缓存键变→全 miss）；TTL 过期→冷启动 0 命中；不同会话隔离。
+  - 算出的 cache_read 随会话自然增长、自带真实波动，无"恒定比例"破绽。
+- **三层优先级决定 cache_read 真实值**（落库 `cached_tokens`，供后续缓存优化分析）：
+  1. Kiro `tokenUsageEvent.cacheReadInputTokens` 上游真值（opus-4-7/4-8 等会下发，最准）
+  2. 上游不下发真值时 → cache_sim 模拟器（opus-4-6 等）
+  3. 模拟器不可用 → metering 反推 `cache_estimate`（末级兜底）
+  4. 都没有 → 0（未命中）
+- **上报放大改为锚定真值**（`usage::inflate_cache_read`）：
+  `reported = clamp(real × 1.3, real, round(prompt × cap))`，cap 来自配置
+  `perceived_cache_hit_ratio`。`real=0`（冷启动/换模型/未命中）→ 报 0，不再凭空捏造命中。
+  保留真实波动形状（早轮低、晚轮高），又给折扣空间。
+- **`cache_estimate::HIT_THRESHOLD` 0.9 → 0.8**：恒定上报已废弃，回退到稳健阈值
+  （命中/未命中两簇间有干净空隙），避免边界 fresh 请求被误判命中。
+
+### Design Rationale
+
+- 用户原则："做比较真实的缓存命中模拟"，且判定要考虑三要素：①同模型才命中
+  ②用处理后上下文而非用户原始上下文 ③tokenize 后比对。三点全部落到 cache_sim 设计里。
+- `cached_tokens`（真实值）与 `cache_read_reported`（放大上报值）分两列：前者是审计/重拟合
+  的 ground truth，后者是发给 NewAPI 的计费值，互不污染。
+- 折扣倍率 1.3 + cap 0.85（推荐）：在真实命中率上温和放大换折扣，远比 flat 95% 可信。
+
+### Notes & Caveats
+
+- token 估算仍是字数近似（`token::count_tokens`），模拟 cache_read 是近似值——符合"计费
+  够用就行、可接受偶尔误判"的既定取舍，不是逐 token 精确。
+- `/cc/v1/messages` buffered 流路径未接入 sim（该路径日志系统本就不完整）；其余三条路径
+  （`/v1/messages` 流式/非流式、`/cc` 非流式）全部接入。
+- cache_sim 状态表是进程内单例：多 worker/重启会冷启动，影响的是"模拟命中"的连续性，
+  不影响上游真值路径（opus-4-7/4-8）。
+
+### 部署与验证
+
+- **部署**：`local-musl-v48`（sha `df0f2ed9…f8b80`），远端 build → `--force-recreate --no-build`。
+- **对抗审查**：codex CLI 本轮环境性卡死（trivial prompt 能答、读文件审查必挂），按 SOP 回退到
+  GPT-5.4(sonnet) code-reviewer 做对抗审查。结论：无高置信上线阻断项；关键不变量
+  （cached_tokens 不被放大污染 / Some(0) 不 fallthrough / provider 重试不重复 advance baseline /
+  Mutex 防 poison）均成立。审查框架引出一处 medium 一致性修复：当 sim/估算给出明确结论时，
+  即便 raw=0 也记 cached_tokens，避免 finish 的 apply_cache_estimate 末级估算覆盖本处决策。
+- **线上端到端验证**（4 轮 × opus-4-7 真值 / opus-4-6 模拟）：
+  - 冷启动 t1：raw=0、reported=0（不再凭空 95%）。
+  - 命中轮 reported/raw 恒 ×1.30（锚定真值），rep_r 自然散布 0.50→0.63→0.77→0.80，无恒定常数破绽。
+  - 4-7 真值路径 raw=Kiro tokenUsageEvent 真值；4-6 模拟路径 raw=prefix 模拟值，两者随会话升温。
+  - cached_tokens（真值）与 cache_read_reported（×1.3 放大）DB 分列、互不污染。
+
 ## [v47] - 2026-06-03
 
 ### Fixes —— fake thinking 路径补发合成签名（修复 opus-4-6 "签名失败"）
