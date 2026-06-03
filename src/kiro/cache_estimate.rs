@@ -47,10 +47,11 @@
 //! | sonnet-4-6-thinking | prompt<25k | 16 | 2.53e-6 | 3.93e-4 | 0.89 |
 //! | haiku-4-5 | prompt<25k | 26 | 1.42e-6 | 3.90e-5 | 0.92 |
 
-/// 命中判定阈值：ratio 低于此值视为命中。
-/// v27 起放宽 0.8 → 0.9（更激进，多识别为命中，配合 95% 感知放大让用户账单更便宜）。
-/// 代价：边界 miss（ratio 0.85-0.95 区间）会被误判为 hit、按 95% 缓存上报。
-const HIT_THRESHOLD: f64 = 0.9;
+/// 命中判定阈值默认值：ratio 低于此值视为命中。运行时实际值来自
+/// config.cache.hitThreshold（admin 可热调），由 [`estimate_with_threshold`] 传入。
+/// 0.8 是稳健默认——命中/未命中两簇间有干净空隙[0.72,0.86]。
+/// 注意：本估算仅是 prefix 缓存模拟器（cache_sim）也不可用时的末级兜底。
+pub const DEFAULT_HIT_THRESHOLD: f64 = 0.8;
 
 /// cache_read 相对全价的"省下比例"——按 0.1× 计费即省 0.9。
 const CACHE_READ_SAVING: f64 = 0.9;
@@ -120,7 +121,7 @@ pub struct CacheEstimate {
     pub cache_read_tokens: i32,
 }
 
-/// 估计一次请求是否命中 Kiro prompt cache。
+/// 估计一次请求是否命中 Kiro prompt cache（用默认阈值 [`DEFAULT_HIT_THRESHOLD`]）。
 ///
 /// 返回 None 表示无法判断（未知模型，或缺 metering/输入）。
 pub fn estimate(
@@ -128,6 +129,17 @@ pub fn estimate(
     prompt_tokens: i32,
     output_tokens: i32,
     metering: f64,
+) -> Option<CacheEstimate> {
+    estimate_with_threshold(model, prompt_tokens, output_tokens, metering, DEFAULT_HIT_THRESHOLD)
+}
+
+/// 同 [`estimate`]，但用显式命中阈值（运行时从 config.cache.hitThreshold 传入）。
+pub fn estimate_with_threshold(
+    model: &str,
+    prompt_tokens: i32,
+    output_tokens: i32,
+    metering: f64,
+    hit_threshold: f64,
 ) -> Option<CacheEstimate> {
     if prompt_tokens <= 0 || metering <= 0.0 {
         return None;
@@ -142,7 +154,7 @@ pub fn estimate(
     }
 
     let ratio = metering / expected_nocache;
-    let hit = ratio < HIT_THRESHOLD;
+    let hit = ratio < hit_threshold;
 
     let cache_read_tokens = if hit {
         let input_cost = metering - base.b * output - base.c;
@@ -204,12 +216,12 @@ mod tests {
 
     #[test]
     fn opus47_thinking_uses_separate_baseline() {
-        // v27 阈值 0.9：找一组样本使 plain ratio > 0.9（miss）、thinking ratio < 0.9（hit）。
-        // prompt=5000, compl=1500, met=0.55：
-        //   plain expected = 8.37e-6·5000 + 296e-6·1500 = 0.486 → ratio ≈ 1.13 → MISS
-        //   thinking expected = 7.22e-6·5000 + 406e-6·1500 = 0.645 → ratio ≈ 0.85 → HIT
-        let plain = estimate("claude-opus-4-7", 5000, 1500, 0.55).unwrap();
-        let think = estimate("claude-opus-4-7-thinking", 5000, 1500, 0.55).unwrap();
+        // 阈值 0.8：构造一组样本使 plain ratio > 0.8（miss）、thinking ratio < 0.8（hit）。
+        // prompt=5000, compl=3000, met=0.85：
+        //   plain expected = 8.37e-6·5000 + 296e-6·3000 = 0.9299 → ratio ≈ 0.914 → MISS
+        //   thinking expected = 7.22e-6·5000 + 406e-6·3000 = 1.2541 → ratio ≈ 0.678 → HIT
+        let plain = estimate("claude-opus-4-7", 5000, 3000, 0.85).unwrap();
+        let think = estimate("claude-opus-4-7-thinking", 5000, 3000, 0.85).unwrap();
         assert!(!plain.hit, "plain ratio={}", plain.ratio);
         assert!(think.hit, "thinking ratio={}", think.ratio);
     }
@@ -235,9 +247,10 @@ mod tests {
 
     #[test]
     fn opus48_thinking_uses_thinking_baseline() {
-        // thinking 变体走独立 baseline（b 更高）
-        let plain = estimate("claude-opus-4-8", 5000, 1500, 0.55).unwrap();
-        let think = estimate("claude-opus-4-8-thinking", 5000, 1500, 0.55).unwrap();
+        // thinking 变体走独立 baseline（b 更高）；阈值 0.8 下用高 output 样本区分。
+        // prompt=5000, compl=3000, met=0.85 → plain ratio≈0.914 MISS / thinking≈0.678 HIT
+        let plain = estimate("claude-opus-4-8", 5000, 3000, 0.85).unwrap();
+        let think = estimate("claude-opus-4-8-thinking", 5000, 3000, 0.85).unwrap();
         assert!(!plain.hit, "plain 4-8 ratio={}", plain.ratio);
         assert!(think.hit, "thinking 4-8 ratio={}", think.ratio);
     }
