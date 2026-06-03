@@ -230,6 +230,14 @@ pub struct SchedulingResponse {
     pub affinity_map_ttl_secs: u64,
     /// 感知缓存命中放大比例（0-1；null = 未启用放大，按真实值上报）
     pub perceived_cache_hit_ratio: Option<f64>,
+    /// 缓存上报锚定放大倍率（config.cache.readMultiplier）
+    pub cache_read_multiplier: f64,
+    /// metering 反推命中判定阈值（config.cache.hitThreshold）
+    pub cache_hit_threshold: f64,
+    /// 缓存模拟器条目 TTL（秒，config.cache.simTtlSecs）
+    pub cache_sim_ttl_secs: u64,
+    /// 缓存模拟器最大会话数（config.cache.maxSessions）
+    pub cache_max_sessions: usize,
 }
 
 /// 更新调度策略请求（各字段可选，仅更新提供的项）
@@ -244,6 +252,14 @@ pub struct UpdateSchedulingRequest {
     pub perceived_cache_hit_ratio: Option<f64>,
     /// 显式关闭感知缓存放大（true=设为 None，按真实值上报）。缺省=不改
     pub disable_perceived_cache: Option<bool>,
+    /// 缓存上报放大倍率。缺省=不改
+    pub cache_read_multiplier: Option<f64>,
+    /// metering 命中判定阈值。缺省=不改
+    pub cache_hit_threshold: Option<f64>,
+    /// 缓存模拟器 TTL（秒）。缺省=不改
+    pub cache_sim_ttl_secs: Option<u64>,
+    /// 缓存模拟器最大会话数。缺省=不改
+    pub cache_max_sessions: Option<usize>,
 }
 
 // ============ 反代 API Key 配置（多 key） ============

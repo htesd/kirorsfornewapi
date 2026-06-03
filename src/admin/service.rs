@@ -319,6 +319,10 @@ impl AdminService {
             affinity_promote_threshold: self.token_manager.get_affinity_promote_threshold(),
             affinity_map_ttl_secs: self.token_manager.get_affinity_map_ttl_secs(),
             perceived_cache_hit_ratio: self.token_manager.get_perceived_cache_hit_ratio(),
+            cache_read_multiplier: self.token_manager.get_cache_read_multiplier(),
+            cache_hit_threshold: self.token_manager.get_cache_hit_threshold(),
+            cache_sim_ttl_secs: self.token_manager.get_cache_sim_ttl_secs(),
+            cache_max_sessions: self.token_manager.get_cache_max_sessions(),
         }
     }
 
@@ -365,6 +369,36 @@ impl AdminService {
             }
             self.token_manager
                 .set_perceived_cache_hit_ratio(Some(r))
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(m) = req.cache_read_multiplier {
+            if !(0.0..=10.0).contains(&m) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "cacheReadMultiplier 必须在 [0, 10] 区间".to_string(),
+                ));
+            }
+            self.token_manager
+                .set_cache_read_multiplier(m)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(t) = req.cache_hit_threshold {
+            if !(0.0..=5.0).contains(&t) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "cacheHitThreshold 必须在 [0, 5] 区间".to_string(),
+                ));
+            }
+            self.token_manager
+                .set_cache_hit_threshold(t)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(ttl) = req.cache_sim_ttl_secs {
+            self.token_manager
+                .set_cache_sim_ttl_secs(ttl)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(n) = req.cache_max_sessions {
+            self.token_manager
+                .set_cache_max_sessions(n)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
         Ok(self.get_scheduling())

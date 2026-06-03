@@ -354,6 +354,17 @@ pub async fn post_messages(
     // 记下映射后的 upstream model（如果转换层做了 model 映射）
     builder.set_upstream_model(payload.model.clone());
 
+    // Prefix 缓存命中模拟：在处理后上下文（即将发给 Kiro 的 conversation_state）上，
+    // 按真实 prefix cache 原理算模拟 cache_read，作为"上游不下发真值"模型的兜底。
+    // 必须在 conversation_state 被移入 KiroRequest 前、且每请求恰好一次（会更新会话态）。
+    let sim_cache_read: Option<i32> = {
+        let cs = &conversion_result.conversation_state;
+        let session_key = cs.conversation_id.clone();
+        let fps = crate::kiro::cache_sim::fingerprints_from_state(cs);
+        let sim = crate::kiro::cache_sim::observe(&session_key, &payload.model, fps);
+        Some(sim.cache_read_tokens as i32)
+    };
+
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -421,6 +432,7 @@ pub async fn post_messages(
             recorder,
             perceived_ratio,
             allowed_group,
+            sim_cache_read,
         )
         .await
     } else {
@@ -436,6 +448,7 @@ pub async fn post_messages(
             recorder,
             perceived_ratio,
             allowed_group,
+            sim_cache_read,
         )
         .await
     }
@@ -453,6 +466,7 @@ async fn handle_stream_request(
     recorder: Option<LogRecorder>,
     perceived_cache_hit_ratio: Option<f64>,
     allowed_group: Option<std::collections::HashSet<u64>>,
+    sim_cache_read: Option<i32>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移 + 分组隔离）
     let outcome = match provider
@@ -473,6 +487,9 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
+    ctx.set_cache_read_multiplier(provider.cache_read_multiplier());
+    ctx.set_cache_hit_threshold(provider.cache_hit_threshold());
+    ctx.set_sim_cache_read(sim_cache_read);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -610,6 +627,11 @@ fn create_sse_stream(
                                 // input 优先用 contextUsageEvent 的真实值（与发给客户端的 message_delta 一致）
                                 b.set_prompt_tokens(ctx.context_input_tokens.unwrap_or(ctx.input_tokens));
                                 b.set_completion_tokens(ctx.output_tokens);
+                                // 真实值（上游/模拟/估算择一）写入 cached_tokens；在 finish 的
+                                // apply_cache_estimate 之前设置，使其据此跳过 metering 反推。
+                                if let Some(raw) = ctx.emitted_raw_cache_read {
+                                    b.set_cached_tokens(raw);
+                                }
                                 if let Some(cr) = ctx.emitted_cache_read {
                                     b.set_cache_read_reported(cr);
                                 }
@@ -664,6 +686,7 @@ async fn handle_non_stream_request(
     recorder: Option<LogRecorder>,
     perceived_cache_hit_ratio: Option<f64>,
     allowed_group: Option<std::collections::HashSet<u64>>,
+    sim_cache_read: Option<i32>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移 + 分组隔离）
     let outcome = match provider.call_api_in_group(request_body, allowed_group).await {
@@ -885,21 +908,63 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
-    // 决定 cache_read：tokenUsageEvent 真值 > cache_estimate 回退 > 0
-    let raw_cache_read = cache_read_input_tokens.unwrap_or_else(|| {
-        metering_usage
+    // 决定 cache_read 的"真实值"（落库到 cached_tokens，供后续缓存优化分析）：
+    //   1. Kiro tokenUsageEvent.cacheReadInputTokens —— 上游真值，最准（opus-4-7/4-8 等）
+    //   2. prefix 缓存模拟器（sim_cache_read）—— 上游不下发真值时按真实 prefix 原理模拟（opus-4-6 等）
+    //   3. metering 反推（cache_estimate）—— 模拟器也不可用时的末级兜底
+    //   4. 0 —— 都拿不到，按未命中
+    // `cache_read_source` 仅用于日志/诊断，区分真值 vs 模拟。
+    let (raw_cache_read, cache_read_source) = if let Some(real) = cache_read_input_tokens {
+        (real, "upstream")
+    } else if let Some(sim) = sim_cache_read.filter(|v| *v > 0) {
+        (sim, "sim")
+    } else {
+        let est = metering_usage
             .and_then(|m| {
-                crate::kiro::cache_estimate::estimate(model, final_input_tokens, output_tokens, m)
+                crate::kiro::cache_estimate::estimate_with_threshold(
+                    model,
+                    final_input_tokens,
+                    output_tokens,
+                    m,
+                    provider.cache_hit_threshold(),
+                )
             })
             .map(|e| e.cache_read_tokens)
-            .unwrap_or(0)
-    });
-    let cache_read = super::usage::inflate_cache_read(
-        final_input_tokens,
+            .unwrap_or(0);
+        (est, "estimate")
+    };
+    // 落库真实值（NULL=三层都没结论/未知模型，0=明确未命中，>0=命中）。
+    // 只要任一层给出了结论（上游真值 / sim 已跑 / 估算命中），就记下决定值——
+    // 这会让 finish 的 apply_cache_estimate 跳过，避免末级 metering 估算覆盖本处决策、
+    // 造成 cached_tokens 与 cache_read_reported 依据不一致。
+    if cache_read_input_tokens.is_some() || sim_cache_read.is_some() || raw_cache_read > 0 {
+        builder.set_cached_tokens(raw_cache_read);
+    }
+    tracing::debug!(
+        source = cache_read_source,
         raw_cache_read,
-        perceived_cache_hit_ratio,
+        sim = ?sim_cache_read,
+        "non-stream cache_read 决策"
     );
-    let cache_creation = cache_creation_input_tokens.unwrap_or(0).max(0);
+
+    // 零输出保护：output=0（用户无任何产出）→ 不计费缓存读/创建。
+    // 真实值仍已落库 cached_tokens（上方），只把上报值归零。
+    let zero_output = output_tokens <= 0;
+    let cache_read = if zero_output {
+        0
+    } else {
+        super::usage::inflate_cache_read(
+            final_input_tokens,
+            raw_cache_read,
+            perceived_cache_hit_ratio,
+            provider.cache_read_multiplier(),
+        )
+    };
+    let cache_creation = if zero_output {
+        0
+    } else {
+        cache_creation_input_tokens.unwrap_or(0).max(0)
+    };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1092,6 +1157,15 @@ pub async fn post_messages_cc(
 
     builder.set_upstream_model(payload.model.clone());
 
+    // Prefix 缓存命中模拟（与 /v1/messages 路径一致；在移走 conversation_state 前算一次）
+    let sim_cache_read: Option<i32> = {
+        let cs = &conversion_result.conversation_state;
+        let session_key = cs.conversation_id.clone();
+        let fps = crate::kiro::cache_sim::fingerprints_from_state(cs);
+        let sim = crate::kiro::cache_sim::observe(&session_key, &payload.model, fps);
+        Some(sim.cache_read_tokens as i32)
+    };
+
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1137,7 +1211,7 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder, perceived_ratio, allowed_group).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, builder, recorder, perceived_ratio, allowed_group, sim_cache_read).await
     }
 }
 
@@ -1173,6 +1247,8 @@ async fn handle_stream_request_buffered(
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
     ctx.set_perceived_cache_hit_ratio(perceived_cache_hit_ratio);
+    ctx.set_cache_read_multiplier(provider.cache_read_multiplier());
+    ctx.set_cache_hit_threshold(provider.cache_hit_threshold());
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
